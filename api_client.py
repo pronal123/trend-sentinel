@@ -13,7 +13,7 @@ PROXY_URL = os.getenv("PROXY_URL")
 async def fetch_dexscreener_data(session, chain, pair_addresses):
     """
     DEX Screenerからプロキシを経由してデータを取得します。
-    あらゆる予期せぬエラーにも対応し、必ずリストを返すように修正しました。
+    あらゆる予期せぬエラーにも対応し、必ずリストを返します。
     """
     if not pair_addresses: 
         return []
@@ -30,10 +30,8 @@ async def fetch_dexscreener_data(session, chain, pair_addresses):
             data = await response.json()
             logging.info(f"Successfully fetched data for {chain} via proxy.")
             return data.get('pairs', [])
-    # 【重要】あらゆるエラーを捕捉するように修正
     except Exception as e:
         logging.error(f"DEX Screener API failed for {chain} via proxy. Reason: {e}.")
-        # どんなエラーが発生しても、必ず空のリストを返す
         return []
 
 async def fetch_social_data(session, token_symbol):
@@ -46,12 +44,24 @@ async def fetch_social_data(session, token_symbol):
         return {"mentions": 0, "status": "unavailable"}
 
 async def fetch_all_data_concurrently(target_pairs):
-    """全ての外部APIからデータを並列で取得します。"""
+    """
+    全ての外部APIからデータを並列で取得します。
+    TypeErrorを回避し、デプロイ問題を検知するロジックを追加しました。
+    """
     async with aiohttp.ClientSession() as session:
         market_tasks = [fetch_dexscreener_data(session, chain, pairs) for chain, pairs in target_pairs.items() if pairs]
         market_results = await asyncio.gather(*market_tasks)
         
-        all_pairs = [pair for chain_result in market_results for pair in chain_result]
+        # 【重要】TypeErrorを回避し、デプロイ問題を検知する安全なループ処理
+        all_pairs = []
+        for i, chain_result in enumerate(market_results):
+            if chain_result is None:
+                # このログが出力された場合、古いコードが実行されていることが確定します
+                logging.critical(f"FATAL: Result from task {i} was None. This indicates a DEPLOYMENT ISSUE. The latest api_client.py is not running.")
+                continue # Noneの場合はスキップして処理を続行
+            
+            all_pairs.extend(chain_result)
+
         if not all_pairs: 
             return []
 
