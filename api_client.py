@@ -22,7 +22,6 @@ async def fetch_dexscreener_data(session, chain, pair_addresses):
     }
     
     try:
-        # 【重要】リクエストにプロキシ設定(proxy=PROXY_URL)を追加
         async with session.get(url, timeout=25, headers=headers, proxy=PROXY_URL) as response:
             response.raise_for_status()
             data = await response.json()
@@ -30,6 +29,7 @@ async def fetch_dexscreener_data(session, chain, pair_addresses):
             return data.get('pairs', [])
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         logging.error(f"DEX Screener API failed for {chain} via proxy. Reason: {e}.")
+        # 【重要】エラー発生時も空リストを返すように修正
         return []
 
 async def fetch_social_data(session, token_symbol):
