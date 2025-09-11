@@ -1,0 +1,9 @@
+apscheduler==3.10.4
+aiohttp
+pandas
+python-dotenv
+scikit-learn
+joblib
+pytz
+gunicorn
+Flask
