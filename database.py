@@ -1,109 +1,132 @@
-import sqlite3
+import os
 import logging
 from datetime import datetime, timedelta
-from config import DB_FILE, NOTIFICATION_COOLDOWN_HOURS, ML_LABEL_LOOKBACK_HOURS
+from sqlalchemy import create_engine, text, exc
+from config import (
+    DB_FILE, 
+    NOTIFICATION_COOLDOWN_HOURS, 
+    ML_LABEL_LOOKBACK_HOURS,
+    DATABASE_URL
+)
+
+# DATABASE_URLが設定されていればPostgreSQLを、なければSQLiteをフォールバックとして使用
+if DATABASE_URL:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+else:
+    engine = create_engine(f"sqlite:///{DB_FILE}")
 
 def init_db():
     """データベースとテーブルを初期化する"""
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS notification_history (
-            token_address TEXT PRIMARY KEY,
-            last_notified TEXT NOT NULL
-        )
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS market_data_history (
-            timestamp TEXT,
-            token_address TEXT,
-            price_usd REAL,
-            volume_h24 REAL,
-            price_change_h1 REAL,
-            price_change_h24 REAL,
-            social_mentions INTEGER,
-            future_price_grew INTEGER,
-            PRIMARY KEY (timestamp, token_address)
-        )
-        """)
-    logging.info("Database initialized successfully.")
+    if not engine: return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS notification_history (
+                token_address VARCHAR(255) PRIMARY KEY,
+                last_notified TIMESTAMP NOT NULL
+            );
+            """))
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS market_data_history (
+                timestamp TIMESTAMP,
+                token_address VARCHAR(255),
+                price_usd FLOAT,
+                future_price_usd FLOAT,
+                volume_h24 FLOAT,
+                price_change_h1 FLOAT,
+                price_change_h24 FLOAT,
+                social_mentions INTEGER,
+                rsi_14 FLOAT,
+                PRIMARY KEY (timestamp, token_address)
+            );
+            """))
+        logging.info("Database initialized successfully.")
+    except Exception as e:
+        logging.error(f"Failed to initialize DB: {e}")
 
 def check_if_recently_notified(conn, token_address):
     """指定されたトークンが最近通知されたかチェックする"""
-    cursor = conn.cursor()
-    cursor.execute("SELECT last_notified FROM notification_history WHERE token_address = ?", (token_address,))
-    result = cursor.fetchone()
+    query = text("SELECT last_notified FROM notification_history WHERE token_address = :addr")
+    result = conn.execute(query, {"addr": token_address}).fetchone()
     if result and result[0]:
-        last_notified = datetime.fromisoformat(result[0])
-        if (datetime.now() - last_notified).total_seconds() < NOTIFICATION_COOLDOWN_HOURS * 3600:
+        if (datetime.now() - result[0]).total_seconds() < NOTIFICATION_COOLDOWN_HOURS * 3600:
             return True
     return False
 
-def record_notification(conn, token_address):
+def record_notification(conn, token_addresses):
     """通知をDBに記録する"""
-    conn.execute(
-        "INSERT OR REPLACE INTO notification_history (token_address, last_notified) VALUES (?, ?)",
-        (token_address, datetime.now().isoformat())
-    )
+    if not isinstance(token_addresses, list): token_addresses = [token_addresses]
+    if not token_addresses: return
+
+    now = datetime.now()
+    records = [{"addr": addr, "ts": now} for addr in token_addresses]
+    
+    # PostgreSQLとSQLiteでUPSERTの構文が異なるため、分岐
+    if engine.dialect.name == 'postgresql':
+        stmt = text("""
+        INSERT INTO notification_history (token_address, last_notified) VALUES (:addr, :ts)
+        ON CONFLICT (token_address) DO UPDATE SET last_notified = EXCLUDED.last_notified;
+        """)
+    else: # SQLite
+        stmt = text("""
+        INSERT OR REPLACE INTO notification_history (token_address, last_notified) VALUES (:addr, :ts);
+        """)
+    conn.execute(stmt, records)
 
 def insert_market_data_batch(conn, market_data_list):
     """現在の市場データ群を履歴テーブルに一括挿入する"""
-    records_to_insert = []
-    now_iso = datetime.now().isoformat()
+    records = []
+    now = datetime.now()
     for token in market_data_list:
         try:
             if not token.get('priceUsd') or not token.get('baseToken'): continue
-            records_to_insert.append((
-                now_iso,
-                token['baseToken']['address'],
-                float(token['priceUsd']),
-                token.get('volume', {}).get('h24'),
-                token.get('priceChange', {}).get('h1'),
-                token.get('priceChange', {}).get('h24'),
-                token.get('social_data', {}).get('mentions')
-            ))
-        except (TypeError, KeyError) as e:
-            logging.warning(f"Skipping record due to malformed data for {token.get('baseToken', {}).get('symbol')}: {e}")
+            records.append({
+                "ts": now, "addr": token['baseToken']['address'], "price": float(token['priceUsd']),
+                "vol": token.get('volume', {}).get('h24'), "h1": token.get('priceChange', {}).get('h1'),
+                "h24": token.get('priceChange', {}).get('h24'), "mentions": token.get('social_data', {}).get('mentions'),
+                "rsi": token.get('indicators', {}).get('rsi_14')
+            })
+        except (TypeError, KeyError): continue
+    
+    if not records: return
+    stmt = text("""
+    INSERT INTO market_data_history (timestamp, token_address, price_usd, volume_h24, price_change_h1, price_change_h24, social_mentions, rsi_14)
+    VALUES (:ts, :addr, :price, :vol, :h1, :h24, :mentions, :rsi) ON CONFLICT DO NOTHING;
+    """)
+    conn.execute(stmt, records)
+    if len(records) > 0:
+        logging.info(f"Logged {len(records)} new records to market_data_history.")
 
-    if not records_to_insert: return
-    with conn:
-        cursor = conn.cursor()
-        cursor.executemany("""
-            INSERT INTO market_data_history (timestamp, token_address, price_usd, volume_h24, price_change_h1, price_change_h24, social_mentions)
-            VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(timestamp, token_address) DO NOTHING;
-        """, records_to_insert)
-        if cursor.rowcount > 0:
-            logging.info(f"Logged {cursor.rowcount} new records to market_data_history.")
-
-def update_future_growth_labels(conn, current_market_data):
-    """現在の価格を使い、過去のデータにML用の結果ラベルを書き込む"""
-    current_price_map = {
-        token['baseToken']['address']: float(token['priceUsd'])
-        for token in current_market_data if token.get('priceUsd') and token.get('baseToken')
-    }
-    if not current_price_map: return
-
+def update_future_growth_labels(conn):
+    """1時間前のデータに現在の価格を記録する"""
     target_time = datetime.now() - timedelta(hours=ML_LABEL_LOOKBACK_HOURS)
-    time_window_start = (target_time - timedelta(minutes=5)).isoformat()
-    time_window_end = (target_time + timedelta(minutes=5)).isoformat()
+    time_window_start = target_time - timedelta(minutes=10)
+    time_window_end = target_time + timedelta(minutes=10)
+    
+    # 1時間前に記録されたトークンリストを取得
+    query_tokens = text("""
+    SELECT DISTINCT token_address FROM market_data_history 
+    WHERE future_price_usd IS NULL AND timestamp BETWEEN :start AND :end
+    """)
+    tokens_to_update = conn.execute(query_tokens, {"start": time_window_start, "end": time_window_end}).fetchall()
 
-    with conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT timestamp, token_address, price_usd FROM market_data_history
-            WHERE future_price_grew IS NULL AND timestamp BETWEEN ? AND ?
-        """, (time_window_start, time_window_end))
-        records_to_update = cursor.fetchall()
-
-        updates_for_db = []
-        for timestamp, token_address, old_price in records_to_update:
-            if token_address in current_price_map and old_price and old_price > 0:
-                current_price = current_price_map[token_address]
-                price_growth = (current_price - old_price) / old_price
-                future_price_grew = 1 if price_growth > 0.10 else 0
-                updates_for_db.append((future_price_grew, timestamp, token_address))
-
-        if updates_for_db:
-            cursor.executemany("UPDATE market_data_history SET future_price_grew = ? WHERE timestamp = ? AND token_address = ?", updates_for_db)
-            if cursor.rowcount > 0:
-                logging.info(f"Updated {cursor.rowcount} ML labels in history table.")
+    updates_for_db = []
+    for (token_address,) in tokens_to_update:
+        # 各トークンの最新の価格を取得
+        query_latest_price = text("SELECT price_usd FROM market_data_history WHERE token_address = :addr ORDER BY timestamp DESC LIMIT 1")
+        current_record = conn.execute(query_latest_price, {"addr": token_address}).fetchone()
+        
+        if current_record:
+            updates_for_db.append({
+                "price": current_record[0], "addr": token_address,
+                "start": time_window_start, "end": time_window_end
+            })
+    
+    if updates_for_db:
+        stmt_update = text("""
+        UPDATE market_data_history SET future_price_usd = :price 
+        WHERE token_address = :addr AND future_price_usd IS NULL AND timestamp BETWEEN :start AND :end
+        """)
+        result = conn.execute(stmt_update, updates_for_db)
+        if result.rowcount > 0:
+            logging.info(f"Updated {result.rowcount} future price labels in history table.")
