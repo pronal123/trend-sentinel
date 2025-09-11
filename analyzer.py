@@ -6,9 +6,12 @@ from ml_model import load_model, predict_surge_probability
 def analyze_and_detect_signals(all_pairs_data, db_conn):
     """データ分析とシグナル検知のコアロジック"""
     model = load_model()
-    long_candidates, short_candidates, pump_alerts = [], [], []
+    long_candidates, short_candidates = [], []
 
-    if not all_pairs_data: return [], [], [], {}
+    if not all_pairs_data:
+        # データがない場合は3つの値を返す
+        return [], [], {'監視銘柄数': 0, '上昇': 0, '下落': 0}
+
     df = pd.DataFrame(all_pairs_data)
     
     # データクレンジング
@@ -25,12 +28,10 @@ def analyze_and_detect_signals(all_pairs_data, db_conn):
         surge_prob = predict_surge_probability(model, token.to_dict())
         token['surge_probability'] = surge_prob
         
-        # --- 検知ロジック ---
-        # LONG候補
+        # 検知ロジック
         if token['h24'] >= 12 and token['h1'] >= 5 and token['volume_h24'] > 100000 and surge_prob > 0.6:
             long_candidates.append(token)
             
-        # SHORT候補
         if token['h24'] <= -8 and token['h1'] <= -3 and token['volume_h24'] > 100000:
             short_candidates.append(token)
 
@@ -47,4 +48,6 @@ def analyze_and_detect_signals(all_pairs_data, db_conn):
         '上昇': len(df[df['h24'] > 0]),
         '下落': len(df[df['h24'] < 0]),
     }
-    return long_candidates, short_candidates, [], market_overview
+    
+    # ✅ 修正点: 返り値の数を3つに修正
+    return long_candidates, short_candidates, market_overview
