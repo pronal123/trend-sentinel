@@ -15,13 +15,13 @@ async def fetch_dexscreener_data(session, chain, pair_addresses):
     
     url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{','.join(pair_addresses)}"
     
-    # 一般的なブラウザを装うためのヘッダー
+    # 【重要】一般的なブラウザを装うためのヘッダー
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     
     try:
-        # getリクエストにheadersを追加して送信
+        # 【重要】getリクエストにheadersを追加して送信
         async with session.get(url, timeout=15, headers=headers) as response:
             response.raise_for_status()  # 4xx, 5xxエラーの場合は例外を発生させる
             data = await response.json()
@@ -41,7 +41,6 @@ async def fetch_social_data(session, token_symbol):
     try:
         # 実際のAPI呼び出しをシミュレート
         await asyncio.sleep(random.uniform(0.1, 0.3))
-        # if random.random() < 0.1: raise aiohttp.ClientError("Service Unavailable") # メンテナンスのシミュレーション
         return {"mentions": random.randint(10, 200), "status": "ok"}
     except Exception as e:
         logging.warning(f"Social media API is unavailable for ${token_symbol}. Reason: {e}. Proceeding without it.")
