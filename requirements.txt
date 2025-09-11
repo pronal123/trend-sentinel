@@ -1,3 +1,4 @@
+# requirements.txt
 apscheduler==3.10.4
 aiohttp
 pandas
@@ -7,3 +8,4 @@ joblib
 pytz
 gunicorn
 Flask
+pandas-ta  # この行を追加
