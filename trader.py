@@ -4,37 +4,54 @@ import asyncio
 
 # プロジェクト内の他モジュールをインポート
 from config import (
+    EXCHANGE_NAME,
     EXCHANGE_API_KEY,
     EXCHANGE_API_SECRET,
+    EXCHANGE_API_PASSPHRASE,
     PAPER_TRADING_ENABLED,
     POSITION_RISK_PERCENT,
     STOP_LOSS_PERCENT,
     TAKE_PROFIT_PERCENT
 )
 from database import get_open_position, log_trade_open, log_trade_close
-# ✅ 修正点: 統一された通知関数をインポート
 from notifier import format_and_send_notification
 from strategy import make_final_trade_decision
 
 def initialize_exchange():
-    """取引所オブジェクトを初期化する"""
+    """取引所オブジェクトを動的に初期化する"""
     if not EXCHANGE_API_KEY or not EXCHANGE_API_SECRET:
         logging.warning("Exchange API keys are not set. Trading is disabled.")
         return None
     
-    exchange = ccxt.binance({
+    try:
+        exchange_class = getattr(ccxt, EXCHANGE_NAME)
+    except AttributeError:
+        logging.error(f"Exchange '{EXCHANGE_NAME}' is not supported by ccxt.")
+        return None
+
+    config = {
         'apiKey': EXCHANGE_API_KEY,
         'secret': EXCHANGE_API_SECRET,
         'options': {
             'defaultType': 'future',
         },
-    })
+    }
+    
+    # Bitgetの場合、パスフレーズを追加
+    if EXCHANGE_NAME == 'bitget':
+        config['password'] = EXCHANGE_API_PASSPHRASE
+
+    exchange = exchange_class(config)
     
     if PAPER_TRADING_ENABLED:
-        logging.warning("PAPER TRADING IS ENABLED. Connecting to testnet.")
-        exchange.set_sandbox_mode(True)
+        logging.warning(f"PAPER TRADING IS ENABLED. Connecting to {EXCHANGE_NAME} testnet.")
+        try:
+            exchange.set_sandbox_mode(True)
+        except ccxt.NotSupported:
+            logging.error(f"{EXCHANGE_NAME} does not support sandbox mode via ccxt. Trading disabled for safety.")
+            return None
     else:
-        logging.warning("LIVE TRADING IS ENABLED. Real funds will be used.")
+        logging.warning(f"LIVE TRADING IS ENABLED on {EXCHANGE_NAME}. Real funds will be used.")
         
     return exchange
 
@@ -50,7 +67,7 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
         
         # --- クローズロジック ---
         if current_position:
-            # (このサンプルでは、反対の強いシグナルが出た場合に決済するロジック)
+            # (このサンプルでは、反対の強いシグナルが出た場合に決済)
             is_long = current_position['side'] == 'long'
             best_short = shorts[0] if shorts else None
             best_long = longs[0] if longs else None
@@ -63,7 +80,6 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
 
             if close_signal:
                 logging.info(f"Close signal received for {current_position['symbol']}. Closing position.")
-                # ... (実際の決済注文ロジックをここに追加) ...
                 
                 # ダミーの決済価格と損益計算
                 exit_price = close_signal['priceUsd']
@@ -78,7 +94,6 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
                 trade_info = {'type': 'close', 'symbol': current_position['symbol'], 'pnl': pnl, 'pnl_percent': pnl_percent, 'balance': balance}
                 asyncio.run(format_and_send_notification(trade_info, notification_type='trade'))
                 return
-
 
         # --- 新規エントリーロジック ---
         if not current_position:
@@ -132,10 +147,15 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
                     'entry_price': entry_price, 'sl_price': sl_price, 'tp_price': tp_price,
                     'balance': balance
                 }
-                # ✅ 修正点: 統一された関数を正しく呼び出す
                 asyncio.run(format_and_send_notification(trade_info, notification_type='trade'))
 
+    except ccxt.NotSupported:
+        logging.error(f"The configured exchange '{EXCHANGE_NAME}' does not support a required feature (e.g., sandbox mode).")
+        # 取引を無効化するため、グローバルなexchangeオブジェクトをNoneにする
+        global exchange
+        exchange = None
     except ccxt.BaseError as e:
         logging.error(f"An exchange error occurred in the trading logic: {e}")
     except Exception as e:
         logging.critical(f"A critical unexpected error occurred in trader: {e}", exc_info=True)
+
