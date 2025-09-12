@@ -3,7 +3,7 @@ import logging
 import sqlite3
 import sys
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import create_engine
 
@@ -34,13 +34,8 @@ TARGET_PAIRS = {
 async def data_collection_job():
     logging.info("🔬 Starting data collection job...")
     try:
-        all_data = await fetch_all_data_concurrently(TARGET_PAIRS)
-        if all_data:
-            # データベース接続用のエンジンを直接使用
-            with create_engine(DATABASE_URL or f"sqlite:///{DB_FILE}").connect() as db_conn:
-                with db_conn.begin():
-                    # (データベース操作関数を呼び出し)
-                    pass # 実際のDB操作はanalyzer内などで行うため、ここでは省略
+        await fetch_all_data_concurrently(TARGET_PAIRS)
+        # データ収集とDB保存はapi_clientと連携して行われるため、ここでは呼び出しのみ
     except Exception as e:
         logging.critical(f"Error in data collection job: {e}", exc_info=True)
 
@@ -52,10 +47,10 @@ async def analysis_and_alert_job():
         if all_data:
             with create_engine(DATABASE_URL or f"sqlite:///{DB_FILE}").connect() as db_conn:
                 with db_conn.begin():
-                    # ✅ 修正点: analyzerからの4つの戻り値を受け取る
+                    # analyzerから4つの戻り値を受け取る
                     longs, shorts, all_indicators, overview = analyze_and_detect_signals(all_data, db_conn)
                 
-                # 取引ロジックにシグナルと全指標を渡す
+                # ✅ 修正点: 取引ロジックにシグナルと全指標を渡す
                 execute_trade_logic(longs, shorts, all_indicators, overview)
 
                 # 通知は上位3件に絞って送信
@@ -71,8 +66,14 @@ async def analysis_and_alert_job():
 
 # --- スケジューラ用の同期ラッパー ---
 def run_async_job(job_func):
-    # (変更なし)
-    pass
+    try:
+        asyncio.run(job_func())
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(job_func())
+        else:
+            asyncio.run(job_func())
 
 def data_collection_wrapper(): run_async_job(data_collection_job)
 def analysis_and_alert_wrapper(): run_async_job(analysis_and_alert_job)
@@ -84,8 +85,16 @@ def home():
 
 @app.route('/train')
 def trigger_training():
-    # (変更なし)
-    pass
+    secret_key = request.args.get('secret')
+    if not TRAIN_SECRET_KEY or secret_key != TRAIN_SECRET_KEY:
+        return "🚫 Unauthorized", 401
+    try:
+        logging.info("Manual training triggered via webhook.")
+        train_model()
+        return "✅ Training process started successfully.", 200
+    except Exception as e:
+        logging.error(f"Failed to start training: {e}")
+        return f"🔥 Error starting training: {e}", 500
 
 # --- メインの起動処理 ---
 def start_scheduler():
@@ -95,10 +104,8 @@ def start_scheduler():
     scheduler.add_job(analysis_and_alert_wrapper, 'cron', hour='2,8,14,20', minute=2)
     scheduler.start()
     logging.info("Scheduler started in background.")
-    # 起動時の初回実行は任意
-    # data_collection_wrapper()
-    # analysis_and_alert_wrapper()
-
+    # 起動時の初回ジョブ
+    data_collection_wrapper()
 
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1].lower() == 'train':
@@ -109,5 +116,4 @@ if __name__ == '__main__':
         port = int(os.environ.get("PORT", 8080))
         app.run(host="0.0.0.0", port=port)
 else:
-    # Gunicornからインポートされた場合にスケジューラを起動
     start_scheduler()
