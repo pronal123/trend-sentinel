@@ -1,220 +1,148 @@
-import os
+# database.py (修正後のフルコード)
+import sqlite3
 import logging
-import pickle
-from datetime import datetime, timedelta
-from sqlalchemy import create_engine, text
+from config import DB_FILE, DATABASE_URL
 
-# プロジェクトの設定ファイルをインポート
-from config import (
-    DB_FILE,
-    DATABASE_URL,
-    NOTIFICATION_COOLDOWN_HOURS,
-    ML_LABEL_LOOKBACK_HOURS
-)
+# ロギング設定
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# DATABASE_URLが設定されていればPostgreSQLを、なければSQLiteをフォールバックとして使用
-if DATABASE_URL:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-else:
-    engine = create_engine(f"sqlite:///{DB_FILE}")
+def get_db_connection():
+    """データベース接続を取得する"""
+    if DATABASE_URL:
+        # PostgreSQLの場合 (Render)
+        # SQLAlchemyやpsycopg2のようなライブラリを使用する必要があります
+        # このサンプルではSQLiteをエミュレートするが、本番では適切なDB接続に置き換える
+        logging.warning("DATABASE_URL is set, but this simple example uses SQLite. "
+                        "For production with PostgreSQL, use a proper ORM/driver.")
+        return sqlite3.connect(DB_FILE) # ローカルテスト用に引き続きSQLiteを使用
+    else:
+        # SQLiteの場合
+        return sqlite3.connect(DB_FILE)
 
 def init_db():
-    """データベースとテーブル（trade_historyを含む）を初期化する"""
-    if not engine:
-        logging.error("Database engine not created. Check DATABASE_URL.")
-        return
-    try:
-        with engine.connect() as conn:
-            with conn.begin(): # トランザクション内で全テーブル作成を保証
-                conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS notification_history (
-                    token_address VARCHAR(255) PRIMARY KEY,
-                    last_notified TIMESTAMP NOT NULL
-                );
-                """))
-                conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS market_data_history (
-                    timestamp TIMESTAMP,
-                    token_address VARCHAR(255),
-                    price_usd FLOAT,
-                    future_price_usd FLOAT,
-                    volume_h24 FLOAT,
-                    price_change_h1 FLOAT,
-                    price_change_h24 FLOAT,
-                    social_mentions INTEGER,
-                    rsi_14 FLOAT,
-                    holder_change_24h FLOAT,
-                    PRIMARY KEY (timestamp, token_address)
-                );
-                """))
-                conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS trained_models (
-                    model_name VARCHAR(50) PRIMARY KEY,
-                    model_data BYTEA,
-                    trained_at TIMESTAMP
-                );
-                """))
-                conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS trade_history (
-                    id SERIAL PRIMARY KEY,
-                    symbol VARCHAR(50) NOT NULL,
-                    side VARCHAR(10) NOT NULL,
-                    amount FLOAT NOT NULL,
-                    entry_price FLOAT NOT NULL,
-                    exit_price FLOAT,
-                    pnl FLOAT,
-                    status VARCHAR(10) NOT NULL, -- 'OPEN' or 'CLOSED'
-                    opened_at TIMESTAMP NOT NULL,
-                    closed_at TIMESTAMP
-                );
-                """))
-        logging.info("Database tables checked/created successfully.")
-    except Exception as e:
-        logging.error(f"Failed to initialize DB: {e}", exc_info=True)
+    """データベースを初期化し、必要なテーブルを作成する"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-def save_model_to_db(model_name, model_object):
-    """学習済みモデルをデータベースに保存する"""
-    if not engine: return
-    serialized_model = pickle.dumps(model_object)
-    
-    stmt_sql = """
-        INSERT INTO trained_models (model_name, model_data, trained_at) VALUES (:name, :data, :ts)
-        ON CONFLICT (model_name) DO UPDATE SET model_data = EXCLUDED.model_data, trained_at = EXCLUDED.trained_at;
-    """
-    if engine.dialect.name != 'postgresql':
-        stmt_sql = """
-        INSERT OR REPLACE INTO trained_models (model_name, model_data, trained_at) VALUES (:name, :data, :ts);
-        """
-    
-    with engine.connect() as conn:
-        with conn.begin():
-            conn.execute(text(stmt_sql), {"name": model_name, "data": serialized_model, "ts": datetime.utcnow()})
-    logging.info(f"Model '{model_name}' saved to database.")
+    # オープンポジションテーブル
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS open_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            amount REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
 
-def load_model_from_db(model_name):
-    """データベースから学習済みモデルを読み込む"""
-    if not engine: return None
-    stmt = text("SELECT model_data FROM trained_models WHERE model_name = :name")
-    with engine.connect() as conn:
-        result = conn.execute(stmt, {"name": model_name}).fetchone()
-        if result and result[0]:
-            logging.info(f"Model '{model_name}' loaded from database.")
-            return pickle.loads(result[0])
-    logging.warning(f"Model '{model_name}' not found in database.")
-    return None
+    # トレード履歴テーブル
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS trade_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            amount REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            exit_price REAL,
+            pnl REAL,
+            status TEXT NOT NULL, -- 'open' or 'closed'
+            open_time DATETIME NOT NULL,
+            close_time DATETIME
+        )
+    ''')
+    
+    # ✅ 追加: シグナルログテーブル
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS signal_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            token_address TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            signal_type TEXT NOT NULL, -- 'long' or 'short'
+            ai_confidence REAL NOT NULL,
+            price_usd REAL NOT NULL,
+            decision TEXT NOT NULL, -- 'Approved' or 'Rejected'
+            rejection_reason TEXT -- 拒否された場合のみ理由を記録
+        )
+    ''')
+
+
+    conn.commit()
+    conn.close()
+    logging.info("Database initialized.")
 
 def log_trade_open(symbol, side, amount, entry_price):
-    """新規ポジションを取引履歴に記録する"""
-    stmt = text("""
-    INSERT INTO trade_history (symbol, side, amount, entry_price, status, opened_at)
-    VALUES (:symbol, :side, :amount, :price, 'OPEN', :ts);
-    """)
-    with engine.connect() as conn:
-        with conn.begin():
-            conn.execute(stmt, {"symbol": symbol, "side": side, "amount": amount, "price": entry_price, "ts": datetime.utcnow()})
-    logging.info(f"Logged new OPEN position for {symbol}.")
+    """オープンポジションとトレード履歴に新しいトレードを記録する"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('INSERT INTO open_positions (symbol, side, amount, entry_price) VALUES (?, ?, ?, ?)',
+                   (symbol, side, amount, entry_price))
+    
+    cursor.execute('INSERT INTO trade_history (symbol, side, amount, entry_price, status, open_time) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)',
+                   (symbol, side, amount, entry_price, 'open'))
+    
+    conn.commit()
+    conn.close()
+    logging.info(f"Trade opened: {side} {amount} of {symbol} at {entry_price}")
 
 def log_trade_close(symbol, exit_price, pnl):
-    """ポジションの決済を取引履歴に記録する"""
-    stmt = text("""
-    UPDATE trade_history SET status = 'CLOSED', exit_price = :exit_price, pnl = :pnl, closed_at = :ts
-    WHERE symbol = :symbol AND status = 'OPEN';
-    """)
-    with engine.connect() as conn:
-        with conn.begin():
-            conn.execute(stmt, {"symbol": symbol, "exit_price": exit_price, "pnl": pnl, "ts": datetime.utcnow()})
-    logging.info(f"Logged CLOSED position for {symbol}.")
+    """オープンポジションを閉じ、トレード履歴を更新する"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # オープンポジションを取得
+    cursor.execute('SELECT id, amount, entry_price, side FROM open_positions WHERE symbol = ?', (symbol,))
+    position = cursor.fetchone()
+
+    if position:
+        pos_id, amount, entry_price, side = position
+        
+        # オープンポジションを削除
+        cursor.execute('DELETE FROM open_positions WHERE id = ?', (pos_id,))
+        
+        # トレード履歴を更新
+        cursor.execute('''
+            UPDATE trade_history
+            SET exit_price = ?, pnl = ?, status = ?, close_time = CURRENT_TIMESTAMP
+            WHERE symbol = ? AND status = 'open'
+        ''', (exit_price, pnl, 'closed', symbol))
+        
+        conn.commit()
+        logging.info(f"Trade closed: {symbol} at {exit_price}. PnL: {pnl}")
+    else:
+        logging.warning(f"No open position found for {symbol} to close.")
+    
+    conn.close()
 
 def get_open_position():
-    """現在保有中のポジションを取得する"""
-    stmt = text("SELECT symbol, side, amount, entry_price FROM trade_history WHERE status = 'OPEN' LIMIT 1;")
-    with engine.connect() as conn:
-        result = conn.execute(stmt).fetchone()
-        if result:
-            return dict(result._mapping)
+    """現在開いているポジションを一つ取得する (単一ポジション戦略用)"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT symbol, side, amount, entry_price FROM open_positions LIMIT 1')
+    position = cursor.fetchone()
+    conn.close()
+    
+    if position:
+        return {'symbol': position[0], 'side': position[1], 'amount': position[2], 'entry_price': position[3]}
     return None
 
-def check_if_recently_notified(conn, token_address):
-    """指定されたトークンが最近通知されたかチェックする"""
-    query = text("SELECT last_notified FROM notification_history WHERE token_address = :addr")
-    result = conn.execute(query, {"addr": token_address}).fetchone()
-    if result and result[0]:
-        last_notified_utc = result[0].replace(tzinfo=None)
-        if (datetime.utcnow() - last_notified_utc).total_seconds() < NOTIFICATION_COOLDOWN_HOURS * 3600:
-            return True
-    return False
-
-def record_notification(conn, token_addresses):
-    """シグナル通知をDBに記録する"""
-    if not isinstance(token_addresses, list): token_addresses = [token_addresses]
-    if not token_addresses: return
-
-    now_utc = datetime.utcnow()
-    records = [{"addr": addr, "ts": now_utc} for addr in token_addresses]
+# ✅ 追加: シグナルログを記録する関数
+def log_signal_decision(token_address, symbol, signal_type, ai_confidence, price_usd, decision, rejection_reason=None):
+    """AIシグナルと戦略の決定をログに記録する"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    stmt_sql = """
-        INSERT INTO notification_history (token_address, last_notified) VALUES (:addr, :ts)
-        ON CONFLICT (token_address) DO UPDATE SET last_notified = EXCLUDED.last_notified;
-    """
-    if engine.dialect.name != 'postgresql':
-        stmt_sql = "INSERT OR REPLACE INTO notification_history (token_address, last_notified) VALUES (:addr, :ts);"
-
-    conn.execute(text(stmt_sql), records)
-
-def insert_market_data_batch(conn, market_data_list):
-    """市場データ群を履歴テーブルに一括挿入する"""
-    records = []
-    now_utc = datetime.utcnow()
-    for token in market_data_list:
-        try:
-            if not token.get('priceUsd') or not token.get('baseToken'): continue
-            records.append({
-                "ts": now_utc, "addr": token['baseToken']['address'], "price": float(token['priceUsd']),
-                "vol": token.get('volume', {}).get('h24'), "h1": token.get('priceChange', {}).get('h1'),
-                "h24": token.get('priceChange', {}).get('h24'), "mentions": token.get('social_data', {}).get('mentions'),
-                "rsi": token.get('indicators', {}).get('rsi_14'),
-                "holders": token.get('onchain_data', {}).get('holder_change_24h')
-            })
-        except (TypeError, KeyError): continue
+    cursor.execute('''
+        INSERT INTO signal_logs (token_address, symbol, signal_type, ai_confidence, price_usd, decision, rejection_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (token_address, symbol, signal_type, ai_confidence, price_usd, decision, rejection_reason))
     
-    if not records: return
-    stmt = text("""
-    INSERT INTO market_data_history (timestamp, token_address, price_usd, volume_h24, price_change_h1, price_change_h24, social_mentions, rsi_14, holder_change_24h)
-    VALUES (:ts, :addr, :price, :vol, :h1, :h24, :mentions, :rsi, :holders) ON CONFLICT (timestamp, token_address) DO NOTHING;
-    """)
-    conn.execute(stmt, records)
-    if len(records) > 0:
-        logging.info(f"Logged {len(records)} new records to market_data_history.")
+    conn.commit()
+    conn.close()
+    logging.info(f"Signal Logged: {symbol} ({signal_type}) - AI: {ai_confidence:.1%} - Decision: {decision}" + (f" ({rejection_reason})" if rejection_reason else ""))
 
-def update_future_growth_labels(conn):
-    """1時間前のデータに現在の価格を記録し、AI学習用の「答え」を作成する"""
-    now_utc = datetime.utcnow()
-    target_time = now_utc - timedelta(hours=ML_LABEL_LOOKBACK_HOURS)
-    time_window_start = target_time - timedelta(minutes=10)
-    time_window_end = target_time + timedelta(minutes=10)
-    
-    query_tokens = text("""
-    SELECT DISTINCT token_address FROM market_data_history 
-    WHERE future_price_usd IS NULL AND timestamp BETWEEN :start AND :end
-    """)
-    tokens_to_update = conn.execute(query_tokens, {"start": time_window_start, "end": time_window_end}).fetchall()
+# データベース初期化を忘れずに呼び出す
+init_db()
 
-    updates_for_db = []
-    for (token_address,) in tokens_to_update:
-        query_latest_price = text("SELECT price_usd FROM market_data_history WHERE token_address = :addr ORDER BY timestamp DESC LIMIT 1")
-        current_record = conn.execute(query_latest_price, {"addr": token_address}).fetchone()
-        
-        if current_record:
-            updates_for_db.append({
-                "price": current_record[0], "addr": token_address,
-                "start": time_window_start, "end": time_window_end
-            })
-    
-    if updates_for_db:
-        stmt_update = text("""
-        UPDATE market_data_history SET future_price_usd = :price 
-        WHERE token_address = :addr AND future_price_usd IS NULL AND timestamp BETWEEN :start AND :end
-        """)
-        result = conn.execute(stmt_update, updates_for_db)
-        if result.rowcount > 0:
-            logging.info(f"Updated {result.rowcount} future price labels in history table.")
