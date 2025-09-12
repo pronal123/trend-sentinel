@@ -52,15 +52,18 @@ def initialize_exchange():
         
     return exchange
 
-exchange = initialize_exchange()
+exchange = initialize_exchange() # グローバル変数として初期化
 
 def execute_trade_logic(longs, shorts, all_indicators, overview):
     """Manages trade strategy decisions and order execution."""
+    # ここでは 'exchange' を読み取るだけなので、global宣言は不要
     if not exchange:
         return
 
     try:
-        global exchange
+        # ✅ 修正: ここでの 'global exchange' は削除
+        # ただし、exceptブロックで'exchange'をNoneに設定する際に必要なので、
+        # そのexceptブロック内でのみ 'global exchange' を宣言する
         
         current_position = get_open_position()
         
@@ -93,10 +96,7 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
 
         # --- New Entry Logic ---
         if not current_position:
-            # ✅ 修正: ここに 'pass' を追加してインデントエラーを回避
-            pass 
-            # (Logic to select best signal is unchanged)
-            # ...
+            pass # インデントエラー回避用のpass
             best_signal = None
             best_long = longs[0] if longs else None
             best_short = shorts[0] if shorts else None
@@ -151,6 +151,8 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
 
 
     except ccxt.NotSupported:
+        # ✅ 修正: ここでだけ global を宣言して値を変更
+        global exchange
         logging.error(f"The configured exchange '{EXCHANGE_NAME}' does not support a required feature. Disabling trading.")
         exchange = None # Modify the global variable
     except ccxt.BaseError as e:
