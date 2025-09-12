@@ -1,13 +1,12 @@
-apscheduler==3.10.4
-aiohttp
+Flask
+SQLAlchemy
+apscheduler
+ccxt
 pandas
-python-dotenv
+numpy
 scikit-learn
 joblib
-pytz
-gunicorn
-Flask
-pandas-ta
-SQLAlchemy
-psycopg2-binary
-ccxt # この行を追加
+python-dotenv
+tqdm
+psycopg2-binary # PostgreSQLを使用する場合
+httpx # ✅ この行を追加
