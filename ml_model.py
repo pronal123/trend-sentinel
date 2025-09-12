@@ -1,101 +1,198 @@
 import pandas as pd
-import logging
-from sklearn.model_selection import train_test_split
+import numpy as np
+from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report
-from sqlalchemy import create_engine
+import joblib # モデルの保存・ロード用
+import logging
+import os
 
-# データベースとモデル操作の関数をインポート
-from config import DATABASE_URL, DB_FILE
-from database import save_model_to_db, load_model_from_db
+from config import MODEL_PATH, ML_LABEL_LOOKBACK_HOURS, ML_PRICE_GROWTH_THRESHOLD
 
-# DATABASE_URLが設定されていればPostgreSQLを、なければSQLiteを使用
-if DATABASE_URL:
-    engine = create_engine(DATABASE_URL)
-else:
-    engine = create_engine(f"sqlite:///{DB_FILE}")
+logger = logging.getLogger(__name__)
 
-def train_model():
-    """DBから履歴データを読み込み、上昇モデルと下落モデルの両方を学習・保存する"""
-    logging.info("Starting model training...")
-    try:
-        with engine.connect() as conn:
-            df = pd.read_sql_query("SELECT * FROM market_data_history", conn)
-    except Exception as e:
-        logging.error(f"Failed to read data from database: {e}")
-        raise
+# ✅ 修正: 以下の行を削除またはコメントアウト
+# from database import save_model_to_db, load_model_from_db
 
-    # ラベル付けされたデータ（答えがあるデータ）が十分にあるか確認
-    if 'future_price_usd' not in df.columns or df['future_price_usd'].isnull().all():
-        raise ValueError("Not enough labeled data to train. Please wait longer.")
+scaler = StandardScaler()
+model = None # グローバル変数としてモデルを初期化
 
-    # ラベル付けされていない行を削除
-    df.dropna(subset=['future_price_usd'], inplace=True)
-    
-    if len(df) < 100: # 学習に最低限必要なデータがあるか確認
-        raise ValueError(f"Not enough labeled data. Found only {len(df)} records.")
-
-    # 教師ラベル（AIが学習する「正解」）を定義
-    df['future_price_grew'] = (df['future_price_usd'] >= df['price_usd'] * 1.10).astype(int)
-    df['future_price_dumped'] = (df['future_price_usd'] <= df['price_usd'] * 0.90).astype(int)
-    
-    # 特徴量データがない行を削除
-    df.dropna(inplace=True)
+def create_features(df):
+    """OHLCVデータから特徴量を作成する"""
+    # 欠損値があれば除去または補完
+    df = df.dropna()
     if df.empty:
-        logging.warning("DataFrame is empty after dropping NA. Cannot train.")
+        return pd.DataFrame()
+
+    # 価格の変動率
+    df['price_change'] = df['close'].pct_change()
+    # ボリュームの変動率
+    df['volume_change'] = df['volume'].pct_change()
+    # 高値と安値の差
+    df['high_low_diff'] = (df['high'] - df['low']) / df['close']
+    # 終値と始値の差
+    df['close_open_diff'] = (df['close'] - df['open']) / df['open']
+    
+    # 複数期間の移動平均
+    df['ma_7'] = df['close'].rolling(window=7).mean()
+    df['ma_25'] = df['close'].rolling(window=25).mean()
+    
+    # RSI (簡易版, ta-libがあればより正確に)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi_14'] = 100 - (100 / (1 + rs))
+
+    # 不要なNaN行を削除
+    df = df.dropna()
+    
+    if df.empty:
+        return pd.DataFrame()
+
+    # 使用する特徴量を選択
+    features = df[['price_change', 'volume_change', 'high_low_diff', 'close_open_diff', 'ma_7', 'ma_25', 'rsi_14']]
+    return features.iloc[-1:].fillna(0) # 最新のデータポイントのみを返す (予測用)
+
+def create_labels(df, lookback_hours=ML_LABEL_LOOKBACK_HOURS, price_growth_threshold=ML_PRICE_GROWTH_THRESHOLD):
+    """OHLCVデータからラベルを作成する (価格上昇/下落/横ばい)"""
+    # lookback_hours後の価格変化に基づいてラベルを生成
+    # 例: 1時間後の価格がprice_growth_threshold以上上がったら 'up' (1)
+    # price_growth_threshold以上下がったら 'down' (0)
+    # それ以外は 'neutral' (2) - このモデルでは0, 1の二値分類を想定
+    
+    if len(df) < lookback_hours + 1:
+        return pd.Series(dtype=int)
+
+    # 将来の価格変化を計算 (lookback_hours後の価格)
+    future_price = df['close'].shift(-lookback_hours)
+    price_change = (future_price - df['close']) / df['close']
+
+    # ラベル付け
+    labels = np.zeros(len(df)) # デフォルトは'down' (0)
+    labels[price_change > price_growth_threshold] = 1 # 'up' (1)
+
+    return pd.Series(labels, index=df.index).iloc[:-lookback_hours] # 未来データ部分は削除
+
+def preprocess_data(ohlcv_df):
+    """生OHLCVデータを機械学習モデル用の特徴量に変換する"""
+    if ohlcv_df.empty:
+        logger.warning("Empty DataFrame provided for preprocessing.")
+        return pd.DataFrame()
+
+    features_df = create_features(ohlcv_df)
+    if features_df.empty:
+        logger.warning("No features generated after creation and dropping NaN.")
+        return pd.DataFrame()
+
+    # スケーリング (モデル学習時に使用したスケーラーを適用)
+    # ここでは仮に新しいスケーラーを使用しているが、実際には学習済みのスケーラーをロードすべき
+    try:
+        if scaler.n_features_in_ is None: # スケーラーがまだfitされていない場合
+             # ダミーでfitするか、学習済みスケーラーをロードする
+             # 本番では学習済みスケーラーをロードすることを推奨
+             scaler.fit(features_df) 
+        scaled_features = scaler.transform(features_df)
+        return pd.DataFrame(scaled_features, columns=features_df.columns, index=features_df.index)
+    except Exception as e:
+        logger.error(f"Error during feature scaling: {e}", exc_info=True)
+        return pd.DataFrame()
+
+def train_model(db_path=None, model_path=MODEL_PATH):
+    """
+    データ取得、特徴量・ラベル作成、モデル学習、保存を行う。
+    db_pathは学習データを取得するためのデータベース接続情報。
+    """
+    logger.info("Starting ML model training...")
+
+    # TODO: 実際にはデータベースから過去のOHLCVデータを取得するロジックをここに実装する
+    # 例: database.get_historical_ohlcv_for_training()
+    # 現状ではダミーデータを使用するか、ファイルからロードするなどが必要
+    
+    # ダミーデータの生成 (実際のデータに置き換えること)
+    num_samples = 1000
+    df_data = {
+        'open': np.random.rand(num_samples) * 100 + 1000,
+        'high': np.random.rand(num_samples) * 10 + df['open'] + 5,
+        'low': np.random.rand(num_samples) * 10 - 5 + df['open'],
+        'close': np.random.rand(num_samples) * 10 + df['open'],
+        'volume': np.random.rand(num_samples) * 1000000
+    }
+    dummy_ohlcv_df = pd.DataFrame(df_data, index=pd.to_datetime(pd.date_range(end=datetime.now(), periods=num_samples, freq='H')))
+
+    # 特徴量とラベルを作成
+    features = create_features(dummy_ohlcv_df)
+    labels = create_labels(dummy_ohlcv_df)
+
+    if features.empty or labels.empty or len(features) != len(labels):
+        logger.error("Not enough data to train the model after feature/label creation.")
         return
 
-    # モデルが学習する特徴量（AIへのヒント）を定義
-    features = [
-        'price_change_h1', 
-        'price_change_h24', 
-        'volume_h24', 
-        'social_mentions', 
-        'rsi_14', 
-        'holder_change_24h' # Moralisから取得した新しい特徴量
-    ]
-    X = df[features]
+    # データのスケーリング
+    global scaler
+    scaler = StandardScaler() # 新しいスケーラーをfit
+    scaled_features = scaler.fit_transform(features)
 
-    # --- 上昇予測モデル (Surge Model) の学習 ---
-    y_surge = df['future_price_grew']
-    if len(y_surge.unique()) > 1:
-        X_train, X_test, y_train, y_test = train_test_split(X, y_surge, test_size=0.25, random_state=42, stratify=y_surge)
-        surge_model = RandomForestClassifier(n_estimators=120, random_state=42, class_weight='balanced', n_jobs=-1)
-        surge_model.fit(X_train, y_train)
-        save_model_to_db('surge', surge_model) # 学習済みモデルをDBに保存
-        logging.info(f"Surge Model Report:\n{classification_report(y_test, surge_model.predict(X_test))}")
+    # モデルの学習 (RandomForestClassifierの例)
+    global model
+    model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
+    model.fit(scaled_features, labels)
+    
+    # 学習済みモデルとスケーラーをファイルに保存
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    joblib.dump(model, model_path)
+    joblib.dump(scaler, MODEL_PATH.replace('.joblib', '_scaler.joblib')) # スケーラーも保存
+    
+    logger.info(f"Model and scaler trained and saved to {model_path} and {MODEL_PATH.replace('.joblib', '_scaler.joblib')}")
 
-    # --- 下落予測モデル (Dump Model) の学習 ---
-    y_dump = df['future_price_dumped']
-    if len(y_dump.unique()) > 1:
-        X_train, X_test, y_train, y_test = train_test_split(X, y_dump, test_size=0.25, random_state=42, stratify=y_dump)
-        dump_model = RandomForestClassifier(n_estimators=120, random_state=42, class_weight='balanced', n_jobs=-1)
-        dump_model.fit(X_train, y_train)
-        save_model_to_db('dump', dump_model) # 学習済みモデルをDBに保存
-        logging.info(f"Dump Model Report:\n{classification_report(y_test, dump_model.predict(X_test))}")
+def load_model(model_path=MODEL_PATH):
+    """
+    保存されたモデルとスケーラーをロードする。
+    ロードに失敗した場合はNoneを返す。
+    """
+    global model, scaler
+    if model is not None and scaler is not None:
+        return model # 既にロード済みなら再ロードしない
 
-def load_model(model_type='surge'):
-    """データベースから学習済みモデルを読み込む"""
-    return load_model_from_db(model_type)
-
-def predict_probability(model, token_data):
-    """与えられたモデルとトークンデータから、イベント発生確率を予測する"""
-    if model is None: 
-        return 0.5
-        
     try:
-        data = {
-            'price_change_h1': token_data.get('priceChange', {}).get('h1', 0),
-            'price_change_h24': token_data.get('priceChange', {}).get('h24', 0),
-            'volume_h24': token_data.get('volume', {}).get('h24', 0),
-            'social_mentions': token_data.get('social_data', {}).get('mentions', 0),
-            'rsi_14': token_data.get('indicators', {}).get('rsi_14', 50),
-            'holder_change_24h': token_data.get('onchain_data', {}).get('holder_change_24h', 0)
-        }
-        features_df = pd.DataFrame([data])
-        # 予測確率 [クラス0の確率, クラス1の確率] のうち、クラス1の方を返す
-        probability = model.predict_proba(features_df)[0][1]
-        return probability
+        if os.path.exists(model_path):
+            model = joblib.load(model_path)
+            logger.info(f"ML model loaded from {model_path}")
+            
+            scaler_path = MODEL_PATH.replace('.joblib', '_scaler.joblib')
+            if os.path.exists(scaler_path):
+                scaler = joblib.load(scaler_path)
+                logger.info(f"Scaler loaded from {scaler_path}")
+            else:
+                logger.warning(f"Scaler not found at {scaler_path}. Initializing new StandardScaler (may affect prediction accuracy).")
+                scaler = StandardScaler() # スケーラーがない場合は初期化
+            
+            return model
+        else:
+            logger.warning(f"ML model file not found at {model_path}. Model needs to be trained.")
+            return None
     except Exception as e:
-        logging.error(f"Error during prediction: {e}")
-        return 0.5
+        logger.error(f"Error loading ML model or scaler: {e}", exc_info=True)
+        return None
+
+def make_prediction(model, preprocessed_data):
+    """
+    前処理されたデータを使ってAI予測を行う。
+    戻り値: 予測クラス (0:down, 1:up), 確率 ([prob_down, prob_up])
+    """
+    if model is None:
+        logger.error("ML model is not loaded. Cannot make prediction.")
+        return None, None
+    if preprocessed_data.empty:
+        logger.warning("Empty preprocessed data provided for prediction.")
+        return None, None
+    
+    try:
+        prediction = model.predict(preprocessed_data)
+        probabilities = model.predict_proba(preprocessed_data)
+        return prediction[0], probabilities
+    except Exception as e:
+        logger.error(f"Error making prediction: {e}", exc_info=True)
+        return None, None
+
+# サービス起動時に一度モデルをロードしようと試みる
+load_model()
