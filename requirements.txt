@@ -10,3 +10,4 @@ Flask
 pandas-ta
 SQLAlchemy
 psycopg2-binary
+ccxt # この行を追加
