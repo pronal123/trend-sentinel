@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import sqlite3
 import sys
 import os
 from flask import Flask, request
@@ -12,9 +11,10 @@ from config import DB_FILE, DATABASE_URL, TRAIN_SECRET_KEY
 from database import init_db
 from api_client import fetch_all_data_concurrently
 from analyzer import analyze_and_detect_signals
-from notifier import format_and_send_telegram_notification, format_and_send_trade_notification
 from ml_model import train_model
 from trader import execute_trade_logic
+# ✅ 修正点: 統一された通知関数をインポート
+from notifier import format_and_send_notification
 
 # --- ロガー設定 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(module)s - %(message)s', stream=sys.stdout)
@@ -34,8 +34,8 @@ TARGET_PAIRS = {
 async def data_collection_job():
     logging.info("🔬 Starting data collection job...")
     try:
+        # データ収集自体はapi_clientで行い、結果はDBに保存される
         await fetch_all_data_concurrently(TARGET_PAIRS)
-        # データ収集とDB保存はapi_clientと連携して行われるため、ここでは呼び出しのみ
     except Exception as e:
         logging.critical(f"Error in data collection job: {e}", exc_info=True)
 
@@ -45,20 +45,24 @@ async def analysis_and_alert_job():
     try:
         all_data = await fetch_all_data_concurrently(TARGET_PAIRS)
         if all_data:
-            with create_engine(DATABASE_URL or f"sqlite:///{DB_FILE}").connect() as db_conn:
+            # DBエンジンを直接使用
+            engine = create_engine(DATABASE_URL or f"sqlite:///{DB_FILE}")
+            with engine.connect() as db_conn:
                 with db_conn.begin():
-                    # analyzerから4つの戻り値を受け取る
                     longs, shorts, all_indicators, overview = analyze_and_detect_signals(all_data, db_conn)
                 
-                # ✅ 修正点: 取引ロジックにシグナルと全指標を渡す
-                execute_trade_logic(longs, shorts, all_indicators, overview)
+                # 取引ロジックは自身の通知機能を持つ
+                execute_trade_logic(longs, shorts, all_indicators)
 
-                # 通知は上位3件に絞って送信
+                # シグナル通知（取引とは別）
                 notification_longs = longs[:3] if longs else []
                 notification_shorts = shorts[:3] if shorts else []
-
                 if notification_longs or notification_shorts:
-                    await format_and_send_telegram_notification(notification_longs, notification_shorts, overview)
+                    # ✅ 修正点: 統一された関数を正しく呼び出す
+                    await format_and_send_notification(
+                        (notification_longs, notification_shorts, overview), 
+                        notification_type='signal'
+                    )
                 else:
                     logging.info("No significant signals found to notify.")
     except Exception as e:
@@ -69,11 +73,12 @@ def run_async_job(job_func):
     try:
         asyncio.run(job_func())
     except RuntimeError:
+        # 既にイベントループが実行中の場合のフォールバック
         loop = asyncio.get_event_loop()
         if loop.is_running():
             loop.create_task(job_func())
         else:
-            asyncio.run(job_func())
+             asyncio.run(job_func())
 
 def data_collection_wrapper(): run_async_job(data_collection_job)
 def analysis_and_alert_wrapper(): run_async_job(analysis_and_alert_job)
@@ -93,8 +98,9 @@ def trigger_training():
         train_model()
         return "✅ Training process started successfully.", 200
     except Exception as e:
-        logging.error(f"Failed to start training: {e}")
-        return f"🔥 Error starting training: {e}", 500
+        error_message = str(e)
+        logging.error(f"Failed to start training: {error_message}")
+        return f"🔥 Error starting training: {error_message}", 500
 
 # --- メインの起動処理 ---
 def start_scheduler():
@@ -108,12 +114,15 @@ def start_scheduler():
     data_collection_wrapper()
 
 if __name__ == '__main__':
+    # コマンドラインから 'train' が指定された場合の処理
     if len(sys.argv) > 1 and sys.argv[1].lower() == 'train':
         init_db()
         train_model()
     else:
+        # 通常のWebサーバーモード
         start_scheduler()
         port = int(os.environ.get("PORT", 8080))
         app.run(host="0.0.0.0", port=port)
 else:
+    # Gunicornからインポートされた場合にスケジューラを起動
     start_scheduler()
