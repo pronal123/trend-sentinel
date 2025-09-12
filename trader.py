@@ -60,12 +60,10 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
         return
 
     try:
-        # ✅ Correction: Declare 'global' at the top of the block
         global exchange
         
         current_position = get_open_position()
         
-        # (Rest of the logic is unchanged)
         # --- Close Logic ---
         if current_position:
             is_long = current_position['side'] == 'long'
@@ -95,11 +93,62 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
 
         # --- New Entry Logic ---
         if not current_position:
+            # ✅ 修正: ここに 'pass' を追加してインデントエラーを回避
+            pass 
             # (Logic to select best signal is unchanged)
             # ...
-            
-            # (Logic to make decision and place order is unchanged)
-            # ...
+            best_signal = None
+            best_long = longs[0] if longs else None
+            best_short = shorts[0] if shorts else None
+
+            if best_long and best_short:
+                if best_long['surge_probability'] > best_short['dump_probability']:
+                    best_signal = {'type': 'long', **best_long}
+                else:
+                    best_signal = {'type': 'short', **best_short}
+            elif best_long:
+                best_signal = {'type': 'long', **best_long}
+            elif best_short:
+                best_signal = {'type': 'short', **best_short}
+
+            if not best_signal:
+                return
+
+            token_addr = best_signal['baseToken']['address']
+            indicators = all_indicators.get(token_addr, {})
+
+            decision = make_final_trade_decision(best_signal, indicators, exchange)
+
+            if decision in ['LONG', 'SHORT']:
+                symbol = best_signal['baseToken']['symbol'] + '/USDT'
+                price = best_signal['priceUsd']
+                
+                balance = exchange.fetch_balance()['USDT']['free']
+                position_size_usdt = balance * POSITION_RISK_PERCENT
+                amount = position_size_usdt / price
+                
+                order_side = 'buy' if decision == 'LONG' else 'sell'
+                sl_price = price * (1 - STOP_LOSS_PERCENT) if decision == 'LONG' else price * (1 + STOP_LOSS_PERCENT)
+                tp_price = price * (1 + TAKE_PROFIT_PERCENT) if decision == 'LONG' else price * (1 - TAKE_PROFIT_PERCENT)
+                
+                logging.warning(f"Strategy approved: {decision}. Placing order for {symbol}.")
+                
+                # --- 実際の注文実行 (テスト中はコメントアウト推奨) ---
+                # market_order = exchange.create_market_order(symbol, order_side, amount)
+                # entry_price = float(market_order['price'])
+                # stop_loss_side = 'sell' if decision == 'LONG' else 'buy'
+                # exchange.create_order(symbol, 'stop_market', stop_loss_side, amount, params={'stopPrice': sl_price})
+                
+                entry_price = price # ダミー価格で代用
+                log_trade_open(symbol, decision.lower(), amount, entry_price)
+                
+                trade_info = {
+                    'type': 'open', 'symbol': symbol, 'side': decision.lower(), 'amount': amount,
+                    'entry_price': entry_price, 'sl_price': sl_price, 'tp_price': tp_price,
+                    'balance': balance
+                }
+                asyncio.run(format_and_send_notification(trade_info, notification_type='trade'))
+
 
     except ccxt.NotSupported:
         logging.error(f"The configured exchange '{EXCHANGE_NAME}' does not support a required feature. Disabling trading.")
@@ -108,4 +157,3 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
         logging.error(f"An exchange error occurred in the trading logic: {e}")
     except Exception as e:
         logging.critical(f"A critical unexpected error occurred in trader: {e}", exc_info=True)
-
