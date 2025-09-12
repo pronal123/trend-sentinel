@@ -17,8 +17,9 @@ from database import get_open_position, log_trade_open, log_trade_close
 from notifier import format_and_send_notification
 from strategy import make_final_trade_decision
 
+# --- Exchange Initialization ---
 def initialize_exchange():
-    """Initializes the exchange object."""
+    """取引所オブジェクトを動的に初期化する"""
     if not EXCHANGE_API_KEY or not EXCHANGE_API_SECRET:
         logging.warning("Exchange API keys are not set. Trading is disabled.")
         return None
@@ -45,25 +46,26 @@ def initialize_exchange():
         try:
             exchange.set_sandbox_mode(True)
         except ccxt.NotSupported:
+            # ✅ 修正点1: sandbox_modeがサポートされていない場合、initialize_exchange自体がNoneを返す
             logging.error(f"{EXCHANGE_NAME} does not support sandbox mode via ccxt. Trading disabled for safety.")
-            return None
+            return None # ここでNoneを返して、グローバルな exchange が設定されないようにする
     else:
         logging.warning(f"LIVE TRADING IS ENABLED on {EXCHANGE_NAME}. Real funds will be used.")
         
     return exchange
 
-exchange = initialize_exchange() # グローバル変数として初期化
+# グローバル変数として一度だけ初期化
+exchange = initialize_exchange()
 
+# --- Trade Logic ---
 def execute_trade_logic(longs, shorts, all_indicators, overview):
-    """Manages trade strategy decisions and order execution."""
-    # ここでは 'exchange' を読み取るだけなので、global宣言は不要
+    """取引戦略の判断と注文実行を管理する"""
+    # グローバルな 'exchange' 変数が None であれば、そのまま終了
     if not exchange:
         return
 
     try:
-        # ✅ 修正: ここでの 'global exchange' は削除
-        # ただし、exceptブロックで'exchange'をNoneに設定する際に必要なので、
-        # そのexceptブロック内でのみ 'global exchange' を宣言する
+        # ✅ 修正点2: ここにあった 'global exchange' は不要なので削除
         
         current_position = get_open_position()
         
@@ -88,7 +90,7 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
                 pnl_percent = (pnl / (entry_price * amount)) * 100
                 
                 log_trade_close(current_position['symbol'], exit_price, pnl)
-                balance = exchange.fetch_balance()['USDT']['total']
+                balance = exchange.fetch_balance()['USDT']['total'] # グローバルなexchangeを読み取り
                 
                 trade_info = {'type': 'close', 'symbol': current_position['symbol'], 'pnl': pnl, 'pnl_percent': pnl_percent, 'balance': balance}
                 asyncio.run(format_and_send_notification(trade_info, notification_type='trade'))
@@ -117,13 +119,13 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
             token_addr = best_signal['baseToken']['address']
             indicators = all_indicators.get(token_addr, {})
 
-            decision = make_final_trade_decision(best_signal, indicators, exchange)
+            decision = make_final_trade_decision(best_signal, indicators, exchange) # グローバルなexchangeを読み取り
 
             if decision in ['LONG', 'SHORT']:
                 symbol = best_signal['baseToken']['symbol'] + '/USDT'
                 price = best_signal['priceUsd']
                 
-                balance = exchange.fetch_balance()['USDT']['free']
+                balance = exchange.fetch_balance()['USDT']['free'] # グローバルなexchangeを読み取り
                 position_size_usdt = balance * POSITION_RISK_PERCENT
                 amount = position_size_usdt / price
                 
@@ -149,13 +151,13 @@ def execute_trade_logic(longs, shorts, all_indicators, overview):
                 }
                 asyncio.run(format_and_send_notification(trade_info, notification_type='trade'))
 
-
     except ccxt.NotSupported:
-        # ✅ 修正: ここでだけ global を宣言して値を変更
-        global exchange
-        logging.error(f"The configured exchange '{EXCHANGE_NAME}' does not support a required feature. Disabling trading.")
-        exchange = None # Modify the global variable
+        # ✅ 修正点3: ここでの global exchange と exchange = None は不要
+        # initialize_exchange が既に None を返しているため、exchange は None のままになる。
+        # この except ブロックに到達することはないはずだが、万が一のロギングとして残す。
+        logging.error(f"A ccxt.NotSupported error occurred unexpectedly in trade logic. This should ideally be caught during initialization.")
     except ccxt.BaseError as e:
         logging.error(f"An exchange error occurred in the trading logic: {e}")
     except Exception as e:
         logging.critical(f"A critical unexpected error occurred in trader: {e}", exc_info=True)
+
