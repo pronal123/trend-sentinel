@@ -9,4 +9,6 @@ pytz
 ccxt
 python-dotenv
 pandas-ta
-requests # <--- 追加
+requests
+SQLAlchemy # <--- 追加
+psycopg2-binary # <--- 追加
