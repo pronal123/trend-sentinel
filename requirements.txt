@@ -1,11 +1,9 @@
-apscheduler
-aiohttp
+# requirements.txt
+Flask
+gunicorn
 pandas
-python-dotenv
-scikit-learn
-joblib
+yfinance
 numpy
-pytz
-pandas-ta
-ccxt
-httpx
+scikit-learn
+mplfinance
+matplotlib
