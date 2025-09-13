@@ -1,5 +1,6 @@
 # state_manager.py
 import time
+import logging
 
 class StateManager:
     def __init__(self, notification_interval=21600): # 6 hours
