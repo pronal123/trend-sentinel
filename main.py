@@ -10,7 +10,7 @@ from config import DB_FILE
 from database import init_db, insert_market_data_batch, update_future_growth_labels
 from api_client import fetch_all_data_concurrently
 from analyzer import analyze_and_detect_signals
-from telegram_bot import format_and_send_telegram_notification # ★★★ ここを修正 ★★★
+from telegram_bot import format_and_send_telegram_notification
 from ml_model import train_model
 
 # --- ロガー設定 ---
@@ -53,7 +53,6 @@ async def analysis_and_alert_job():
         with sqlite3.connect(DB_FILE, timeout=10) as db_conn:
             longs, shorts, pumps, overview = analyze_and_detect_signals(all_data, db_conn)
             if longs or shorts:
-                # ★★★ ここで正しく通知関数を呼び出す ★★★
                 await format_and_send_telegram_notification(longs, shorts, pumps, overview)
             else:
                 logging.info("No significant signals found to notify.")
@@ -88,7 +87,6 @@ async def main(mode=None):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1].lower() == "train":
         print("Running in training mode...")
-        # train_modelは非同期ではないのでasyncio.runは不要
         main(mode="train")
     else:
         asyncio.run(main())
