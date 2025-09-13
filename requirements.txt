@@ -1,13 +1,9 @@
-Flask
-SQLAlchemy
-apscheduler
-ccxt
+apscheduler[asyncio]
+aiohttp
 pandas
-numpy
+python-dotenv
 scikit-learn
 joblib
-python-dotenv
-tqdm
-psycopg2-binary # PostgreSQLを使用する場合
-httpx
-gunicorn
+numpy
+pytz
+pandas-ta
