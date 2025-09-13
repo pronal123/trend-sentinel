@@ -1,61 +1,78 @@
 # main.py
-import os
-import threading
+import schedule
 import time
 import logging
+import threading
 from flask import Flask
+from datetime import datetime
+import pytz
 
-import ml_model
-from trading import TradingBot # クラスをインポート
+# モジュールをインポート
+from data_aggregator import DataAggregator
+from analysis_engine import AnalysisEngine
+from telegram_notifier import TelegramNotifier
+from state_manager import StateManager
+from trading_executor import TradingExecutor # 追加
+import risk_filter
 
-# ログ設定
+# --- 初期設定 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Flaskアプリケーションのインスタンスを作成
+state = StateManager()
+data_agg = DataAggregator()
+analyzer = AnalysisEngine()
+trader = TradingExecutor(state) # stateを共有
+notifier = TelegramNotifier()
 app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "Trading Bot Service is alive and running!"
+    return "Auto Trading Bot is alive!"
 
-def bot_runner_logic():
-    logging.info("🤖 Trading Bot runner has started in the background.")
+def run_trading_cycle():
+    jst = pytz.timezone('Asia/Tokyo')
+    logging.info(f"--- Starting Trading Cycle at {datetime.now(jst).strftime('%H:%M:%S JST')} ---")
     
-    # TradingBotクラスのインスタンスを作成
-    # TODO: 取引したいティッカーや金額をここで設定
-    bot = TradingBot(ticker='BTC/USDT', trade_amount_usd=100.0)
+    # 1. データ収集 -> リスク除外
+    all_data = data_agg.get_all_chains_data()
+    if all_data.empty: return
+    safe_data = risk_filter.filter_risky_tokens(all_data)
+
+    # 2. 分析
+    long_df, short_df, spike_df, summary = analyzer.run_analysis(safe_data)
+
+    # 3. 通知 (重複防止)
+    long_to_notify = long_df[long_df['symbol'].apply(state.can_notify)]
+    # ... (同様にshort, spikeも)
+    notifier.send_notification(long_to_notify, short_df, spike_df, summary)
+    state.record_notification(long_to_notify)
+    # ...
+
+    # 4. 取引実行
+    logging.info("--- Executing Trades based on analysis ---")
+    # LONG候補のトップ1銘柄を取引 (一度に多くのポジションを持たない戦略)
+    if not long_to_notify.empty:
+        top_long_candidate = long_to_notify.iloc[0]
+        logging.info(f"Top LONG candidate: {top_long_candidate['symbol'].upper()}")
+        trader.execute_long(top_long_candidate['id'])
     
+    # SHORT候補に合致する保有中の銘柄があれば売却
+    for _, short_candidate in short_df.iterrows():
+        if state.has_position(short_candidate['id']):
+            logging.info(f"SHORT signal for owned asset: {short_candidate['symbol'].upper()}")
+            trader.execute_short(short_candidate['id'])
+
+    logging.info("--- Trading Cycle Finished ---")
+
+# ... (run_daily_summary, run_scheduler, __main__部分は前回と同様)
+def run_scheduler():
+    schedule.every().day.at("02:00", "Asia/Tokyo").do(run_trading_cycle)
+    # ... 他のスケジュール
     while True:
-        try:
-            # 1. 分析モジュールから売買シグナルを取得
-            # 取引ペアに合わせてティッカーを渡す
-            yf_ticker = bot.ticker.replace('/','-') # yfinance用のティッカー形式に変換
-            signal = ml_model.start_model_analysis(ticker=yf_ticker, period='1y')
-            
-            # 2. シグナルに基づいてBOTのメソッドを呼び出す
-            if signal == 'BUY':
-                bot.execute_buy_order()
-            
-            elif signal == 'SELL':
-                bot.execute_sell_order()
-            
-            else: # HOLD
-                logging.info("Signal is 'HOLD'. No action taken.")
-
-            # 3. 次の実行まで待機
-            logging.info("🕒 Waiting for the next cycle... (1 hour)")
-            time.sleep(3600)
-
-        except Exception as e:
-            logging.error(f"❌ An error occurred in the main bot loop: {e}")
-            time.sleep(300)
+        schedule.run_pending()
+        time.sleep(1)
 
 if __name__ == "__main__":
-    bot_thread = threading.Thread(target=bot_runner_logic)
-    bot_thread.daemon = True
-    bot_thread.start()
-
+    scheduler_thread = threading.Thread(target=run_scheduler)
+    scheduler_thread.start()
     port = int(os.environ.get("PORT", 8080))
-    logging.info(f"🌐 Starting web server on port {port}...")
-    # 本番環境ではGunicornが使われる
     app.run(host='0.0.0.0', port=port)
