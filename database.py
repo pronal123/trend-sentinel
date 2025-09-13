@@ -1,32 +1,63 @@
-# database.py
 import sqlite3
 import logging
 from datetime import datetime, timedelta
-from config import DB_FILE, NOTIFICATION_COOLDOWN_HOURS, ML_LABEL_LOOKBACK_HOURS
+
+# config.pyからインポートすることを想定
+# from config import DB_FILE, NOTIFICATION_COOLDOWN_HOURS, ML_LABEL_LOOKBACK_HOURS
+# 以下はハードコードした仮の値
+DB_FILE = "sentinel_data.db"
+NOTIFICATION_COOLDOWN_HOURS = 6
+ML_LABEL_LOOKBACK_HOURS = 1
+
 
 def init_db():
     """データベースとテーブルを初期化する"""
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
+        
+        # 通知履歴テーブル
         conn.execute("""
         CREATE TABLE IF NOT EXISTS notification_history (
-            token_address TEXT PRIMARY KEY,
+            token_address TEXT PRIMARY KEY, 
             last_notified TEXT NOT NULL
-        )
-        """)
+        )""")
+        
+        # ML用データ履歴テーブル
         conn.execute("""
         CREATE TABLE IF NOT EXISTS market_data_history (
-            timestamp TEXT,
-            token_address TEXT,
-            price_usd REAL,
+            timestamp TEXT, 
+            token_address TEXT, 
+            price_usd REAL, 
             volume_h24 REAL,
-            price_change_h1 REAL,
-            price_change_h24 REAL,
+            price_change_h1 REAL, 
+            price_change_h24 REAL, 
             social_mentions INTEGER,
-            future_price_grew INTEGER,
+            future_price_grew INTEGER, 
             PRIMARY KEY (timestamp, token_address)
-        )
-        """)
+        )""")
+
+        # 現在開いているポジションを管理するテーブル
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS open_positions (
+            symbol TEXT PRIMARY KEY,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            amount REAL NOT NULL,
+            opened_at TEXT NOT NULL
+        )""")
+        
+        # 全ての取引履歴を記録するテーブル
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS trade_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            status TEXT NOT NULL, -- 'OPEN' or 'CLOSE'
+            price REAL NOT NULL,
+            amount REAL NOT NULL,
+            timestamp TEXT NOT NULL
+        )""")
+
     logging.info("Database initialized successfully.")
 
 def check_if_recently_notified(conn, token_address):
@@ -108,3 +139,44 @@ def update_future_growth_labels(conn, current_market_data):
             cursor.executemany("UPDATE market_data_history SET future_price_grew = ? WHERE timestamp = ? AND token_address = ?", updates_for_db)
             if cursor.rowcount > 0:
                 logging.info(f"Updated {cursor.rowcount} ML labels in history table.")
+
+def get_open_position(conn, symbol):
+    """指定されたシンボルのオープンポジションを取得する"""
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM open_positions WHERE symbol = ?", (symbol,))
+    row = cursor.fetchone()
+    if row:
+        keys = [description[0] for description in cursor.description]
+        return dict(zip(keys, row))
+    return None
+
+def log_trade_open(conn, symbol, side, price, amount):
+    """ポジションを開いたことをDBに記録する"""
+    timestamp = datetime.now().isoformat()
+    with conn:
+        conn.execute(
+            "INSERT INTO open_positions (symbol, side, entry_price, amount, opened_at) VALUES (?, ?, ?, ?, ?)",
+            (symbol, side, price, amount, timestamp)
+        )
+        conn.execute(
+            "INSERT INTO trade_history (symbol, side, status, price, amount, timestamp) VALUES (?, ?, 'OPEN', ?, ?, ?)",
+            (symbol, side, price, amount, timestamp)
+        )
+    logging.info(f"OPENED position: {side} {amount} {symbol} @ {price}")
+
+def log_trade_close(conn, symbol, price, amount):
+    """ポジションを閉じたことをDBに記録する"""
+    timestamp = datetime.now().isoformat()
+    with conn:
+        position = get_open_position(conn, symbol)
+        if not position:
+            logging.warning(f"Attempted to close a position that does not exist: {symbol}")
+            return
+        side = position['side']
+        
+        conn.execute("DELETE FROM open_positions WHERE symbol = ?", (symbol,))
+        conn.execute(
+            "INSERT INTO trade_history (symbol, side, status, price, amount, timestamp) VALUES (?, ?, 'CLOSE', ?, ?, ?)",
+            (symbol, side, price, amount, timestamp)
+        )
+    logging.info(f"CLOSED position: {side} {amount} {symbol} @ {price}")
