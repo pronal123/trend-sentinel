@@ -35,10 +35,7 @@ regime_detector = MarketRegimeDetector()
 app = Flask(__name__)
 @app.route('/')
 def health_check():
-    if IS_BOT_ACTIVE:
-        return "✅ Auto Trading Bot is ACTIVE and running!"
-    else:
-        return "🚫 Auto Trading Bot is INACTIVE (standby mode)."
+    return f"✅ Auto Trading Bot is {'ACTIVE' if IS_BOT_ACTIVE else 'INACTIVE'}!"
 
 # --- 5. メインの取引・通知ロジック ---
 def run_trading_cycle():
@@ -47,16 +44,13 @@ def run_trading_cycle():
 
     logging.info("--- 🚀 Starting Trading Cycle ---")
     
-    # 1. 市場レジーム、センチメント、勝率を取得
     btc_series = data_agg.get_historical_data('BTC-USD', '1y')
     market_regime = 'RANGING' if btc_series.empty else regime_detector.get_market_regime(btc_series)
     fng_data = sentiment_analyzer.get_fear_and_greed_index()
     current_win_rate = state.get_win_rate()
 
-    # 2. 既存ポジションの監視・決済
     trader.check_active_positions(data_agg)
 
-    # 3. 新規参入の判断
     candidate_tokens = data_agg.get_top_tokens()
     for token in candidate_tokens:
         if state.has_position(token['id']): continue
@@ -64,7 +58,6 @@ def run_trading_cycle():
         yf_ticker = f"{token['symbol'].upper()}-USD"
         score, series = scorer.calculate_total_score(token, yf_ticker, fng_data, market_regime)
 
-        # スコアをログに出力して判断過程を可視化
         logging.info(f"Analysis complete for {yf_ticker}. Score: {score:.2f}")
 
         if score >= 70:
@@ -79,7 +72,22 @@ def run_trading_cycle():
 
 def run_hourly_status_update():
     logging.info("--- 🕒 Hourly Status Update ---")
+    
     active_positions_details = state.get_all_positions()
+    
+    if not active_positions_details:
+        logging.info("No active positions.")
+    else:
+        logging.info(f"Found {len(active_positions_details)} active position(s):")
+        for token_id, details in active_positions_details.items():
+            logging.info(
+                f"  - Token: {token_id}, "
+                f"Ticker: {details.get('ticker', 'N/A')}, "
+                f"Entry: ${details.get('entry_price', 0):,.4f}, "
+                f"TP: ${details.get('take_profit', 0):,.4f}, "
+                f"SL: ${details.get('stop_loss', 0):,.4f}"
+            )
+    
     if not active_positions_details:
         notifier.send_position_status_update([]); return
 
