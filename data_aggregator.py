@@ -1,57 +1,68 @@
 # data_aggregator.py
 import os
+import logging
 import pandas as pd
 from pycoingecko import CoinGeckoAPI
-import logging
-
-# ... (CHAIN_IDSは変更なし)
+import requests # CryptoCompare APIのために追加
 
 class DataAggregator:
     def __init__(self):
+        self.cg = CoinGeckoAPI()
+        # APIキーを環境変数から読み込む
         self.moralis_api_key = os.environ.get("MORALIS_API_KEY")
-        proxy_url = os.environ.get("PROXY_URL")
-        
-        # プロキシが設定されていれば、それをrequestsセッションに組み込む
-        session_kwargs = {}
-        if proxy_url:
-            session_kwargs['proxies'] = {'http': proxy_url, 'https': proxy_url}
-            logging.info("Proxy configured for data aggregation.")
-            
-        self.cg = CoinGeckoAPI(session_kwargs=session_kwargs)
+        self.cryptocompare_api_key = os.environ.get("CRYPTOCOMPARE_API_KEY")
 
-    def get_onchain_data(self, token_ids):
-        """Moralis APIを使ってオンチェーンデータを取得する（ダミー実装）"""
-        if not self.moralis_api_key:
-            logging.warning("Moralis API key not found. Skipping on-chain data.")
-            return pd.DataFrame()
-        
-        # TODO: Moralis SDKやAPIを呼び出し、token_idsに対応するデータを取得する
-        # 例: トランザクション数、アクティブウォレット数など
-        logging.info(f"Fetching on-chain data for {len(token_ids)} tokens via Moralis...")
-        # 以下はダミーデータ
-        onchain_df = pd.DataFrame({
-            'id': token_ids,
-            'active_wallets_24h': [100 + i*10 for i in range(len(token_ids))]
-        })
-        return onchain_df
-
-    def get_market_data(self, chain_id):
-        # ... (CoinGeckoからのデータ取得ロジックはほぼ同じ)
-        # 取得したデータにオンチェーンデータを結合する
+    def get_onchain_data(self, token_symbol):
+        """Moralisから主要なオンチェーンデータを取得する"""
+        if not self.moralis_api_key: return None
+        logging.info(f"Fetching on-chain data for {token_symbol}...")
         try:
-            coins = self.cg.get_coins_markets(...)
-            if not coins: return pd.DataFrame()
-            df = pd.DataFrame(coins)
-            # ... (カラム名変更など)
-
-            # オンチェーンデータを取得して結合
-            onchain_data = self.get_onchain_data(df['id'].tolist())
-            if not onchain_data.empty:
-                df = pd.merge(df, onchain_data, on='id', how='left')
-
-            return df
+            # ここではダミーデータを返しますが、実際にはMoralis APIを呼び出します
+            # 例：アクティブアドレス数、大口ウォレットの動き、取引量など
+            return {
+                'active_addresses_24h_change': 15.5, # アクティブアドレス変化率(%)
+                'whale_transaction_volume': 5200000, # 大口取引量($)
+            }
         except Exception as e:
-            # ...
-            return pd.DataFrame()
+            logging.error(f"Failed to fetch on-chain data for {token_symbol}: {e}")
+            return None
 
-    # ... (get_all_chains_dataは変更なし)
+    def get_sentiment_data(self, token_symbol):
+        """CryptoCompareからニュースやSNSのセンチメントを取得する"""
+        if not self.cryptocompare_api_key: return None
+        logging.info(f"Fetching sentiment data for {token_symbol}...")
+        try:
+            # CryptoCompare APIのエンドポイント (例)
+            # url = f"https://min-api.cryptocompare.com/data/v2/news/?categories={token_symbol}&api_key={self.cryptocompare_api_key}"
+            # response = requests.get(url).json()
+            # ここではダミーデータを返します
+            return {
+                'news_sentiment_score': 72.8, # ニュースセンチメントスコア (0-100)
+                'twitter_followers_change_24h': 2.1 # Twitterフォロワー変化率 (%)
+            }
+        except Exception as e:
+            logging.error(f"Failed to fetch sentiment data for {token_symbol}: {e}")
+            return None
+
+    def get_enriched_market_data(self):
+        """価格、オンチェーン、センチメントを統合したデータを生成する"""
+        # 1. CoinGeckoから基本市場データを取得
+        base_data = self.get_top_tokens() # 上位銘柄を取得する関数 (既存)
+        enriched_rows = []
+
+        for token in base_data:
+            token_symbol = token['symbol'].upper()
+            
+            # 2. オンチェーンデータを取得
+            onchain_stats = self.get_onchain_data(token_symbol)
+            if onchain_stats:
+                token.update(onchain_stats)
+            
+            # 3. センチメントデータを取得
+            sentiment_stats = self.get_sentiment_data(token_symbol)
+            if sentiment_stats:
+                token.update(sentiment_stats)
+            
+            enriched_rows.append(token)
+            
+        return pd.DataFrame(enriched_rows)
