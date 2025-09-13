@@ -57,6 +57,17 @@ def init_db():
             amount REAL NOT NULL,
             timestamp TEXT NOT NULL
         )""")
+        
+        # 分析シグナルの最終決定を記録するテーブル
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS signal_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            signal_type TEXT NOT NULL, -- 'LONG' or 'SHORT'
+            decision TEXT NOT NULL, -- 'ENTER', 'PASS', 'CLOSE'など
+            reason TEXT
+        )""")
 
     logging.info("Database initialized successfully.")
 
@@ -180,3 +191,13 @@ def log_trade_close(conn, symbol, price, amount):
             (symbol, side, price, amount, timestamp)
         )
     logging.info(f"CLOSED position: {side} {amount} {symbol} @ {price}")
+
+def log_signal_decision(conn, symbol, signal_type, decision, reason=""):
+    """分析シグナルの最終決定をDBに記録する"""
+    timestamp = datetime.now().isoformat()
+    with conn:
+        conn.execute(
+            "INSERT INTO signal_decisions (timestamp, symbol, signal_type, decision, reason) VALUES (?, ?, ?, ?, ?)",
+            (timestamp, symbol, signal_type, decision, reason)
+        )
+    logging.info(f"DECISION LOGGED: {symbol} | {signal_type} -> {decision} | Reason: {reason}")
