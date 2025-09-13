@@ -8,5 +8,5 @@ schedule
 pytz
 ccxt
 python-dotenv
-SQLAlchemy # DB操作ライブラリ
-psycopg2-binary # PostgreSQL接続ドライバ
+pandas-ta
+requests # <--- 追加
