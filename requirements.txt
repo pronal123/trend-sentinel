@@ -1,4 +1,4 @@
-apscheduler[asyncio]
+apscheduler
 aiohttp
 pandas
 python-dotenv
@@ -7,3 +7,4 @@ joblib
 numpy
 pytz
 pandas-ta
+ccxt
