@@ -5,23 +5,43 @@ import ccxt
 
 class TradingExecutor:
     def __init__(self, state_manager):
-        self.state_manager = state_manager # ポジション情報を共有
-        self.ticker_map = {} # CoinGecko IDと取引所ティッカーの対応表
-
+        self.state = state_manager
+        self.exchange = None
+        # ... (前回提示したBitget対応のコードをここに記述)
+        # 認証情報とパスフレーズを環境変数から読み込む
         exchange_id = os.environ.get('EXCHANGE_ID')
         api_key = os.environ.get('EXCHANGE_API_KEY')
-        api_secret = os.environ.get('EXCHANGE_API_SECRET')
+        api_secret = os.environ.get('EXCHANGE_SECRET_KEY')
+        api_passphrase = os.environ.get('EXCHANGE_API_PASSPHRASE')
 
-        if not all([exchange_id, api_key, api_secret]):
-            logging.warning("API keys/Exchange ID not set. TradingExecutor running in SIMULATION mode.")
-            self.exchange = None
+        if not all([exchange_id, api_key, api_secret, api_passphrase]):
+            logging.warning("API credentials not set. Running in SIMULATION mode.")
             return
 
         try:
             exchange_class = getattr(ccxt, exchange_id)
-            self.exchange = exchange_class({'apiKey': api_key, 'secret': api_secret})
+            self.exchange = exchange_class({
+                'apiKey': api_key, 'secret': api_secret, 'password': api_passphrase
+            })
             logging.info(f"TradingExecutor initialized with {exchange_id}.")
-            self.load_markets()
+        except Exception as e:
+            logging.error(f"Failed to initialize exchange: {e}")
+            
+    def execute_long(self, token_id, trade_amount_usd=100.0):
+        if self.state.has_position(token_id):
+             logging.info(f"Already in position for {token_id}. Skipping LONG.")
+             return
+        # ... (取引ロジック)
+        logging.info(f"Executing LONG for {token_id}.")
+        self.state.set_position(token_id, True)
+    
+    def execute_short(self, token_id):
+        if not self.state.has_position(token_id):
+             logging.info(f"Not in position for {token_id}. Skipping SHORT.")
+             return
+        # ... (取引ロジック)
+        logging.info(f"Executing SHORT for {token_id}.")
+        self.state.set_position(token_id, False)
         except Exception as e:
             logging.error(f"Failed to initialize exchange: {e}")
             self.exchange = None
