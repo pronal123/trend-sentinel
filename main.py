@@ -1,36 +1,54 @@
 # main.py
-# ... (インポートと初期化)
-from scoring_engine import ScoringEngine
+import logging, schedule, time, threading
+from dotenv import load_dotenv
 
+# --- 初期化 ---
+load_dotenv()
+from state_manager import StateManager
+from data_aggregator import DataAggregator
+from trading_executor import TradingExecutor
+from scoring_engine import ScoringEngine
+# ... (その他、Flaskなど)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+state = StateManager()
+data_agg = DataAggregator()
+trader = TradingExecutor(state)
 scorer = ScoringEngine(trader.exchange)
+# ...
 
 def run_trading_cycle():
-    if not IS_BOT_ACTIVE: return
     logging.info("--- Starting Trading Cycle ---")
     
-    # 1. データ収集 (yfinanceなどから詳細な時系列データを取得する必要がある)
-    # df_long_term = data_agg.get_historical_data('BTC-USD', '1y')
-    # current_price = df_long_term['Close'].iloc[-1]
+    # 1. 既存ポジションの監視・決済
+    trader.check_active_positions(data_agg)
 
-    # --- ポジション監視フェーズ ---
-    active_positions = state.get_all_positions()
-    for token_id, details in active_positions.items():
-        # TODO: 最新価格を取得
-        # latest_price = data_agg.get_latest_price(token_id)
-        # trader.check_and_execute_exit(token_id, latest_price)
-        pass
-
-    # --- 新規参入判断フェーズ ---
-    # 1. 分析候補を取得
-    # long_df, short_df, ... = analyzer.run_analysis(...)
+    # 2. 新規参入の判断
+    # 監視対象リストを取得 (例: CoinGeckoの上位銘柄)
+    candidate_tokens = data_agg.get_top_tokens() 
     
-    # 2. 候補ごとにスコアリング
-    # top_candidate = long_df.iloc[0]
-    # ticker = trader.get_ticker_for_id(top_candidate['id'])
-    # score = scorer.calculate_total_score(ticker, df_long_term)
-    
-    # 3. 参入判断
-    # if score >= 70:
-    #     trader.execute_long(top_candidate['id'], df_long_term)
+    for token in candidate_tokens:
+        # 既にポジションを持っている銘柄はスキップ
+        if state.has_position(token['id']):
+            continue
 
+        # スコアを計算
+        yf_ticker = f"{token['symbol'].upper()}-USD" # yfinance用のティッカー
+        score, series = scorer.calculate_total_score(token['id'], yf_ticker)
+
+        # 総合得点が70%を超えたら新規ロングポジションを持つ
+        if score >= 70:
+            logging.info(f"🔥 ENTRY SIGNAL: Score for {token['symbol']} is {score:.1f} (>= 70). Opening long position.")
+            trader.open_long_position(token['id'], series)
+            # 1回のサイクルで1ポジションのみ（ドカ買い防止）
+            break 
+    
     logging.info("--- Trading Cycle Finished ---")
+
+# --- スケジューラとWebサーバー起動 ---
+# ... (前回と同様、run_schedulerとif __name__ == "__main__")
+# 実行間隔は短くする（例：5分ごと）
+def run_scheduler():
+    logging.info("Scheduler started.")
+    schedule.every(5).minutes.do(run_trading_cycle)
+    # ...
