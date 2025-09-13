@@ -8,3 +8,4 @@ numpy
 pytz
 pandas-ta
 ccxt
+httpx
