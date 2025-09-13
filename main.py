@@ -1,5 +1,10 @@
 # main.py
-import os, threading, time, logging, schedule, pytz
+import os
+import threading
+import time
+import logging
+import schedule
+import pytz
 from flask import Flask
 from dotenv import load_dotenv
 
@@ -30,24 +35,18 @@ app = Flask(__name__)
 def health_check():
     return f"✅ Auto Trading Bot is {'ACTIVE' if IS_BOT_ACTIVE else 'INACTIVE'}!"
 
-# --- 5. メインの取引ロジック ---
+# --- 5. メインの取引・通知ロジック ---
 def run_trading_cycle():
+    """15分ごとに実行されるメインの取引サイクル"""
     if not IS_BOT_ACTIVE:
         logging.warning("BOT is INACTIVE. Skipping trading cycle.")
         return
 
     logging.info("--- 🚀 Starting Trading Cycle ---")
     
-    # 1. サイクル開始時に現在の勝率を計算
     current_win_rate = state.get_win_rate()
-
-    # 2. 市場全体のセンチメントを取得
     fng_data = sentiment_analyzer.get_fear_and_greed_index()
-
-    # 3. 既存ポジションの監視・決済
     trader.check_active_positions(data_agg)
-
-    # 4. 新規参入の判断
     candidate_tokens = data_agg.get_top_tokens()
     
     for token in candidate_tokens:
@@ -66,10 +65,37 @@ def run_trading_cycle():
     
     logging.info("--- ✅ Trading Cycle Finished ---")
 
+def run_hourly_status_update():
+    """1時間ごとに実行されるポジション状況の通知サイクル"""
+    logging.info("--- 🕒 Hourly Status Update ---")
+    
+    active_positions_details = state.get_all_positions()
+    if not active_positions_details:
+        notifier.send_position_status_update([]) # ポジションがない場合も通知
+        return
+
+    # 各ポジションの最新価格を取得して情報を付加
+    enriched_positions = []
+    for token_id, details in active_positions_details.items():
+        current_price = data_agg.get_latest_price(token_id)
+        if current_price:
+            enriched_positions.append({
+                **details, # entry_price, tickerなど
+                'current_price': current_price
+            })
+    
+    notifier.send_position_status_update(enriched_positions)
+
 # --- 6. スケジューラの定義と実行 ---
 def run_scheduler():
     logging.info("Scheduler started. Waiting for tasks...")
+    jst = pytz.timezone('Asia/Tokyo')
+    
+    # 取引サイクルのスケジュール (15分ごと)
     schedule.every(15).minutes.do(run_trading_cycle)
+
+    # ポジション状況の通知スケジュール (毎時0分)
+    schedule.every().hour.at(":00").do(run_hourly_status_update)
     
     while True:
         schedule.run_pending()
