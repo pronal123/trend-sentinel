@@ -10,5 +10,6 @@ ccxt
 python-dotenv
 pandas-ta
 requests
-SQLAlchemy # <--- 追加
-psycopg2-binary # <--- 追加
+SQLAlchemy
+psycopg2-binary
+scikit-learn # <--- Add this line
