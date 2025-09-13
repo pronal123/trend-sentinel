@@ -81,3 +81,4 @@ def predict_surge_probability(model, token_data):
     except Exception as e:
         logging.error(f"Error during prediction: {e}")
         return 0.5 # エラー時も中立的な値を返す
+
