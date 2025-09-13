@@ -9,4 +9,5 @@ joblib
 python-dotenv
 tqdm
 psycopg2-binary # PostgreSQLを使用する場合
-httpx # ✅ この行を追加
+httpx
+gunicorn
