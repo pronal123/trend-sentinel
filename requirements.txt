@@ -12,4 +12,5 @@ pandas-ta
 requests
 SQLAlchemy
 psycopg2-binary
-scikit-learn # <--- Add this line
+scikit-learn
+yfinance # <--- この行を追加
