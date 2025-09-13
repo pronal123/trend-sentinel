@@ -24,8 +24,6 @@ class TelegramNotifier:
 
         p = position_data
         
-        # 利確・損切時の想定残高を計算
-        # 簡易計算のため、ここでは手数料を考慮しない
         profit_on_tp = (p['take_profit'] - p['entry_price']) * p['position_size']
         loss_on_sl = (p['stop_loss'] - p['entry_price']) * p['position_size']
         balance_at_tp = p['current_balance'] + profit_on_tp
@@ -54,4 +52,43 @@ class TelegramNotifier:
         except Exception as e:
             logging.error(f"Failed to send new position notification: {e}")
 
-    # TODO: send_regular_scan_notification, send_daily_summary などの実装
+    def send_position_status_update(self, active_positions):
+        """
+        1時間ごとに現在のポジション状況を通知する。
+        """
+        if not self.bot: return
+
+        jst = pytz.timezone('Asia/Tokyo')
+        now = datetime.now(jst).strftime('%Y/%m/%d %H:%M JST')
+        
+        message = f"🕒 *ポジション状況 定時報告 ({now})*\n\n"
+
+        if not active_positions:
+            message += "現在、アクティブなポジションはありません。"
+        else:
+            total_pnl = 0
+            for pos in active_positions:
+                # ポジションサイズがなければ計算できないためデフォルト値を設定
+                position_size = pos.get('position_size', (pos.get('trade_amount_usd', 100) / pos['entry_price']))
+                pnl = (pos['current_price'] - pos['entry_price']) * position_size
+                total_pnl += pnl
+                pnl_percent = (pos['current_price'] / pos['entry_price'] - 1) * 100
+                
+                status_emoji = "🟢" if pnl >= 0 else "🔴"
+
+                message += (
+                    f"{status_emoji} *{pos.get('ticker', 'N/A')}*\n"
+                    f"  - 参入価格: ${pos['entry_price']:,.4f}\n"
+                    f"  - 現在価格: ${pos['current_price']:,.4f}\n"
+                    f"  - 含み損益(P/L): *{pnl_percent:+.2f}%* (${pnl:+.2f})\n\n"
+                )
+            
+            total_status_emoji = "🟢" if total_pnl >= 0 else "🔴"
+            message += f"--------------------\n"
+            message += f"{total_status_emoji} *合計含み損益: ${total_pnl:+.2f}*"
+
+        try:
+            self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode='Markdown')
+            logging.info("Sent hourly position status update.")
+        except Exception as e:
+            logging.error(f"Failed to send position status update: {e}")
