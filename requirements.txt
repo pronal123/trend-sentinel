@@ -8,3 +8,4 @@ scikit-learn
 mplfinance
 matplotlib
 pandas-ta
+ccxt # <--- 追加
