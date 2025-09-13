@@ -1,116 +1,59 @@
 # trading_executor.py
-import os
-import logging
-import ccxt
+# ... (前回と同様の__init__部分)
 
 class TradingExecutor:
-    def __init__(self, state_manager):
-        self.state = state_manager
-        self.exchange = None
-        # ... (前回提示したBitget対応のコードをここに記述)
-        # 認証情報とパスフレーズを環境変数から読み込む
-        exchange_id = os.environ.get('EXCHANGE_ID')
-        api_key = os.environ.get('EXCHANGE_API_KEY')
-        api_secret = os.environ.get('EXCHANGE_SECRET_KEY')
-        api_passphrase = os.environ.get('EXCHANGE_API_PASSPHRASE')
+    # ...
+    def execute_long(self, token_id, series, trade_amount_usd=100.0):
+        if self.state.has_position(token_id): return
+        
+        ticker = self.get_ticker_for_id(token_id)
+        if not ticker: return
+            
+        # --- 動的な利確・損切りポイントの計算 ---
+        try:
+            series.ta.atr(append=True)
+            atr = series['ATRr_14'].iloc[-1]
+            current_price = series['Close'].iloc[-1]
+            
+            # 損小利大の原則 (リスク:リワード比 1:2)
+            stop_loss_price = current_price - (atr * 1.5) # 損切りライン (ATRの1.5倍下に設定)
+            take_profit_price = current_price + (atr * 3.0) # 利確ライン (ATRの3.0倍上に設定)
+            
+            logging.info(f"Calculated exit points for {ticker}: TP=${take_profit_price:.4f}, SL=${stop_loss_price:.4f}")
 
-        if not all([exchange_id, api_key, api_secret, api_passphrase]):
-            logging.warning("API credentials not set. Running in SIMULATION mode.")
+        except Exception as e:
+            logging.error(f"Could not calculate ATR for exit points: {e}")
             return
 
-        try:
-            exchange_class = getattr(ccxt, exchange_id)
-            self.exchange = exchange_class({
-                'apiKey': api_key, 'secret': api_secret, 'password': api_passphrase
-            })
-            logging.info(f"TradingExecutor initialized with {exchange_id}.")
-        except Exception as e:
-            logging.error(f"Failed to initialize exchange: {e}")
-            
-    def execute_long(self, token_id, trade_amount_usd=100.0):
-        if self.state.has_position(token_id):
-             logging.info(f"Already in position for {token_id}. Skipping LONG.")
-             return
-        # ... (取引ロジック)
-        logging.info(f"Executing LONG for {token_id}.")
-        self.state.set_position(token_id, True)
-    
-    def execute_short(self, token_id):
-        if not self.state.has_position(token_id):
-             logging.info(f"Not in position for {token_id}. Skipping SHORT.")
-             return
-        # ... (取引ロジック)
-        logging.info(f"Executing SHORT for {token_id}.")
-        self.state.set_position(token_id, False)
-        except Exception as e:
-            logging.error(f"Failed to initialize exchange: {e}")
-            self.exchange = None
-
-    def load_markets(self):
-        try:
-            markets = self.exchange.load_markets()
-            # 例: 'bitcoin' (coingecko) -> 'BTC/USDT' (取引所) の対応表を作成
-            for ticker, market_info in markets.items():
-                if 'baseId' in market_info:
-                    self.ticker_map[market_info['baseId'].lower()] = ticker
-        except Exception as e:
-            logging.error(f"Failed to load markets: {e}")
-
-    def get_ticker_for_id(self, coingecko_id):
-        return self.ticker_map.get(coingecko_id.lower())
-
-    def execute_long(self, token_id, trade_amount_usd=100.0):
+        # --- 注文実行 ---
         if not self.exchange:
             logging.warning(f"--- SIMULATION: Executed LONG for {token_id}. ---")
-            self.state_manager.set_position(token_id, True)
-            return
+        else:
+            try:
+                # ... (実際の買い注文ロジック)
+                pass
+            except Exception as e:
+                logging.error(f"Failed to execute LONG for {ticker}: {e}")
+                return
+
+        # ポジション情報（利確・損切り価格を含む）を記録
+        self.state.set_position(token_id, True, {
+            'entry_price': current_price,
+            'take_profit': take_profit_price,
+            'stop_loss': stop_loss_price
+        })
+
+    def check_and_execute_exit(self, token_id, current_price):
+        """保有ポジションの利確・損切りをチェックして実行する"""
+        position_details = self.state.get_position_details(token_id)
+        if not position_details: return
         
-        if self.state_manager.has_position(token_id):
-            logging.info(f"Already in position for {token_id}. Skipping LONG.")
-            return
-
-        ticker = self.get_ticker_for_id(token_id)
-        if not ticker:
-            logging.warning(f"Ticker for {token_id} not found on exchange. Skipping.")
-            return
-
-        try:
-            logging.info(f"Executing LONG (market buy) for {ticker} with cost {trade_amount_usd} USD.")
-            order = self.exchange.create_market_buy_order_with_cost(ticker, trade_amount_usd)
-            logging.info(f"LONG order successful. Order: {order['id']}")
-            self.state_manager.set_position(token_id, True)
-        except Exception as e:
-            logging.error(f"Failed to execute LONG for {ticker}: {e}")
-
-    def execute_short(self, token_id):
-        if not self.exchange:
-            logging.warning(f"--- SIMULATION: Executed SHORT for {token_id}. ---")
-            self.state_manager.set_position(token_id, False)
-            return
-
-        if not self.state_manager.has_position(token_id):
-            logging.info(f"Not in a position for {token_id}. Skipping SHORT.")
-            return
-        
-        ticker = self.get_ticker_for_id(token_id)
-        if not ticker:
-            logging.warning(f"Ticker for {token_id} not found on exchange. Skipping.")
-            return
+        # 利確チェック
+        if current_price >= position_details['take_profit']:
+            logging.info(f"✅ TAKE PROFIT triggered for {token_id} at ${current_price:.4f}")
+            self.execute_short(token_id) # 全量売却
             
-        try:
-            # 保有量を全量売却
-            asset = ticker.split('/')[0]
-            balance = self.exchange.fetch_balance()
-            amount_to_sell = balance[asset]['free']
-            
-            if amount_to_sell > 0:
-                logging.info(f"Executing SHORT (market sell) for {amount_to_sell} {asset}.")
-                order = self.exchange.create_market_sell_order(ticker, amount_to_sell)
-                logging.info(f"SHORT order successful. Order: {order['id']}")
-                self.state_manager.set_position(token_id, False)
-            else:
-                logging.warning(f"No sellable assets for {ticker}. Updating position state.")
-                self.state_manager.set_position(token_id, False)
-        except Exception as e:
-            logging.error(f"Failed to execute SHORT for {ticker}: {e}")
-
+        # 損切りチェック
+        elif current_price <= position_details['stop_loss']:
+            logging.info(f"🛑 STOP LOSS triggered for {token_id} at ${current_price:.4f}")
+            self.execute_short(token_id) # 全量売却
