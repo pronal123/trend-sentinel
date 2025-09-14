@@ -6,16 +6,10 @@ import requests
 import logging
 
 CHAIN_IDS = {
-    'ethereum': 'ethereum',
-    'solana': 'solana',
-    'base': 'base',
-    'bnb-chain': 'binance-smart-chain',
-    'arbitrum': 'arbitrum-one',
-    'optimism': 'optimistic-ethereum',
-    'polygon': 'polygon-pos',
-    'avalanche': 'avalanche'
+    'ethereum': 'ethereum', 'solana': 'solana', 'base': 'base',
+    'bnb-chain': 'binance-smart-chain', 'arbitrum': 'arbitrum-one',
+    'optimism': 'optimistic-ethereum', 'polygon': 'polygon-pos', 'avalanche': 'avalanche'
 }
-
 class DataAggregator:
     def __init__(self):
         self.cg = CoinGeckoAPI()
@@ -23,15 +17,11 @@ class DataAggregator:
 
     def get_market_data(self, chain_id):
         try:
-            coins = self.cg.get_coins_markets(vs_currency='usd', category=CHAIN_IDS[chain_id], per_page=250, page=1, price_change_percentage='1h,24h')
-            if not coins:
-                return pd.DataFrame()
+            coins = self.cg.get_coins_markets(vs_currency='usd', category=CHAIN_IDS.get(chain_id), per_page=250, page=1, price_change_percentage='1h,24h')
+            if not coins: return pd.DataFrame()
             df = pd.DataFrame(coins)
             df = df[['id', 'symbol', 'current_price', 'total_volume', 'price_change_percentage_24h_in_currency', 'price_change_percentage_1h_in_currency']]
-            df.rename(columns={
-                'price_change_percentage_24h_in_currency': 'price_change_24h',
-                'price_change_percentage_1h_in_currency': 'price_change_1h'
-            }, inplace=True)
+            df.rename(columns={'price_change_percentage_24h_in_currency': 'price_change_24h', 'price_change_percentage_1h_in_currency': 'price_change_1h'}, inplace=True)
             df['volume_change_24h'] = pd.Series(range(100, 100 + len(df) * 5, 5))
             df['volume_15m_multiple'] = pd.Series(range(1, 1 + int(len(df) * 0.1), 1)) * 0.1 + 1
             return df
@@ -41,8 +31,8 @@ class DataAggregator:
 
     def get_all_chains_data(self):
         all_data = []
-        for chain_name, chain_id in CHAIN_IDS.items():
-            chain_data = self.get_market_data(chain_id)
+        for chain_name in CHAIN_IDS.keys():
+            chain_data = self.get_market_data(chain_name)
             if not chain_data.empty:
                 chain_data['chain'] = chain_name
                 all_data.append(chain_data)
@@ -54,8 +44,7 @@ class DataAggregator:
     def fetch_ohlcv(self, yf_ticker, period='1y', interval='1d'):
         try:
             data = yf.download(yf_ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-            if data.empty:
-                return pd.DataFrame()
+            if data.empty: return pd.DataFrame()
             if isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.get_level_values(0)
             data.columns = [col.capitalize() for col in data.columns]
