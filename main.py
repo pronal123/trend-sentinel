@@ -60,9 +60,10 @@ def run_scheduler():
         time.sleep(30)
 
 # ---------------------------------------------------
-# API: JSON形式で最新の市場状況
+# API: JSON形式（内部専用）
 # ---------------------------------------------------
 @app.route("/status")
+@requires_auth
 def status():
     snapshot = build_market_snapshot(state)
     return jsonify(snapshot)
@@ -73,7 +74,7 @@ def status():
 @app.route("/")
 @requires_auth
 def dashboard():
-    html = """
+    html = """ 
     <!DOCTYPE html>
     <html>
     <head>
@@ -132,10 +133,14 @@ def dashboard():
         });
 
         async function fetchStatus() {
-            const res = await fetch('/status');
+            const res = await fetch('/status', { headers: { 'Authorization': 'Basic ' + btoa(prompt("Username:") + ":" + prompt("Password:")) }});
+            if (!res.ok) {
+                document.body.innerHTML = "<h2>認証エラー</h2>";
+                return;
+            }
             const data = await res.json();
 
-            // BTC価格を取得
+            // BTC価格
             const btc = data['BTC'] || {};
             const price = btc.last_price || 0;
             const now = new Date().toLocaleTimeString();
