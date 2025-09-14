@@ -35,7 +35,6 @@ regime_detector = MarketRegimeDetector()
 # --- 4. Webサーバー (Renderのヘルスチェック & 管理/ステータスページ) ---
 app = Flask(__name__)
 
-# --- ▼▼▼ HTMLテンプレートを更新 ▼▼▼ ---
 STATUS_PAGE_HTML = """
 <!DOCTYPE html>
 <html lang="ja">
@@ -47,9 +46,9 @@ STATUS_PAGE_HTML = """
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; color: #333; padding: 2rem; }
         .container { max-width: 800px; margin: auto; background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
         h1, h2 { text-align: center; color: #1a1a1a; }
-        .balance { text-align: center; margin: 2rem 0; }
-        .balance-label { font-size: 1.2rem; color: #555; }
-        .balance-value { font-size: 2.5rem; font-weight: bold; color: #1a1a1a; margin-top: 0.5rem; }
+        .grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 2rem; text-align: center; margin: 2rem 0; }
+        .grid-item .label { font-size: 1.2rem; color: #555; }
+        .grid-item .value { font-size: 2.5rem; font-weight: bold; color: #1a1a1a; margin-top: 0.5rem; }
         table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; }
         th, td { padding: 0.8rem; text-align: left; border-bottom: 1px solid #ddd; }
         th { background-color: #f7f7f7; }
@@ -62,30 +61,33 @@ STATUS_PAGE_HTML = """
     <div class="container">
         <h1>🤖 Bot Status</h1>
         
-        <div class="balance">
-            <div class="balance-label">現在の総資産残高</div>
-            <div class="balance-value">${{ "%.2f"|format(total_balance) }}</div>
+        <div class="grid-container">
+            <div class="grid-item">
+                <div class="label">現在の総資産残高</div>
+                <div class="value">${{ "%.2f"|format(total_balance) }}</div>
+            </div>
+            <div class="grid-item">
+                <div class="label">市場センチメント</div>
+                <div class="value">{{ sentiment.sentiment }} ({{ sentiment.value }})</div>
+            </div>
+            <div class="grid-item">
+                <div class="label">市場レジーム</div>
+                <div class="value">{{ market_regime }}</div>
+            </div>
         </div>
-
+        
         <h2>アクティブなポジション</h2>
         {% if positions %}
             <table>
-                <thead>
-                    <tr>
-                        <th>Ticker</th>
-                        <th>Entry Price</th>
-                        <th>Current Price</th>
-                        <th>Unrealized P/L</th>
-                    </tr>
-                </thead>
+                <thead> <tr> <th>Ticker</th> <th>Entry Price</th> <th>Current Price</th> <th>Unrealized P/L</th> </tr> </thead>
                 <tbody>
                     {% for pos in positions %}
-                        <tr class="{{ 'profit' if pos.pnl_percent >= 0 else 'loss' }}">
-                            <td><strong>{{ pos.ticker }}</strong></td>
-                            <td>${{ "%.4f"|format(pos.entry_price) }}</td>
-                            <td>${{ "%.4f"|format(pos.current_price) }}</td>
-                            <td><strong>{{ "%.2f"|format(pos.pnl_percent) }}%</strong> (${{ "%.2f"|format(pos.pnl) }})</td>
-                        </tr>
+                    <tr class="{{ 'profit' if pos.pnl_percent >= 0 else 'loss' }}">
+                        <td><strong>{{ pos.ticker }}</strong></td>
+                        <td>${{ "%.4f"|format(pos.entry_price) }}</td>
+                        <td>${{ "%.4f"|format(pos.current_price) }}</td>
+                        <td><strong>{{ "%.2f"|format(pos.pnl_percent) }}%</strong> (${{ "%.2f"|format(pos.pnl) }})</td>
+                    </tr>
                     {% endfor %}
                 </tbody>
             </table>
@@ -112,15 +114,21 @@ def health_check():
 def admin_panel():
     return ADMIN_PAGE_HTML
 
-# --- ▼▼▼ この関数を更新 ▼▼▼ ---
 @app.route('/status')
 def position_status_page():
-    """現在のポジション状況と総資産残高をHTMLページとして表示する"""
-    
-    # 1. 取引所から最新の総資産残高を取得
+    # 1. 最新の残高を取得
     total_balance = trader.get_account_balance_usd() or 0.0
     
-    # 2. 現在のポジション情報を取得・整形
+    # 2. 市場レジームを判断
+    btc_series = data_agg.get_historical_data('BTC-USD', '1y')
+    market_regime = 'N/A'
+    if not btc_series.empty:
+        market_regime = regime_detector.get_market_regime(btc_series)
+
+    # 3. センチメント指数を取得
+    sentiment_data = sentiment_analyzer.get_fear_and_greed_index() or {'value': 'N/A', 'sentiment': 'Unknown'}
+
+    # 4. ポジション情報を取得・整形
     active_positions_details = state.get_all_positions()
     enriched_positions = []
     if active_positions_details:
@@ -133,8 +141,14 @@ def position_status_page():
                 details['pnl_percent'] = (current_price / details['entry_price'] - 1) * 100
                 enriched_positions.append(details)
 
-    # 3. HTMLテンプレートに残高とポジション情報を渡してページを生成
-    return render_template_string(STATUS_PAGE_HTML, positions=enriched_positions, total_balance=total_balance)
+    # 5. 全ての情報をHTMLテンプレートに渡してページを生成
+    return render_template_string(
+        STATUS_PAGE_HTML, 
+        positions=enriched_positions, 
+        total_balance=total_balance,
+        market_regime=market_regime,
+        sentiment=sentiment_data
+    )
 
 @app.route('/retrain', methods=['POST'])
 def retrain_model():
@@ -142,6 +156,9 @@ def retrain_model():
     if auth_key != TRAIN_SECRET_KEY:
         return jsonify({"error": "Unauthorized"}), 401
     logging.info("Remote retraining process triggered.")
+    # TODO: 実際の再学習ロジックを非同期で呼び出す
+    # training_thread = threading.Thread(target=ml_model.run_daily_retraining, args=(db_engine, data_agg))
+    # training_thread.start()
     return jsonify({"message": "Model retraining process started."}), 202
 
 # --- 5. メインの取引・通知ロジック ---
@@ -167,7 +184,10 @@ def run_trading_cycle():
 def run_hourly_status_update():
     logging.info("--- 🕒 Hourly Status Update ---")
     active_positions = state.get_all_positions()
-    if not active_positions: logging.info("No active positions."); notifier.send_position_status_update([]); return
+    if not active_positions: 
+        logging.info("No active positions.")
+        notifier.send_position_status_update([])
+        return
     enriched_positions = []
     for token_id, details in active_positions.items():
         price = data_agg.get_latest_price(token_id)
