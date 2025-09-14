@@ -4,14 +4,24 @@ import pandas as pd
 import pandas_ta as ta
 
 class ScoringEngine:
+    """
+    市場の多角的分析とスコアリングを担当する。
+    市場レジームに応じて分析ウェイトを動的に変更し、分析コメントを生成する。
+    """
     def __init__(self, exchange):
         self.exchange = exchange
+        # レジーム別のウェイトを定義
         self.WEIGHTS_TRENDING = {'technical': 25, 'trend': 35, 'sentiment': 15, 'order_book': 25}
         self.WEIGHTS_RANGING = {'technical': 35, 'trend': 5, 'sentiment': 25, 'order_book': 35}
 
     def calculate_total_score(self, token_data, series, fng_data, regime):
+        """
+        渡されたデータを基に全項目を評価し、総合得点、時系列データ、分析コメントを返す。
+        """
+        # --- ▼▼▼ 修正箇所 ▼▼▼ ---
+        # seriesが不正な場合、期待される3つの値を返し、エラーを防ぐ
         if series is None or series.empty or 'close' not in series.columns:
-            return 0, "分析対象の市場データが不完全です。"
+            return 0, series, "分析対象の市場データが不完全か、取得に失敗しました。"
 
         weights = self.WEIGHTS_TRENDING if regime == 'TRENDING' else self.WEIGHTS_RANGING
         
@@ -19,7 +29,6 @@ class ScoringEngine:
         trend_score, trend_comment = self._score_trend(series, weights['trend'])
         sentiment_score, sentiment_comment = self._score_sentiment(fng_data, weights['sentiment'])
         
-        # 取引所のティッカー形式 (例: BTC/USDT) を渡す
         ticker_symbol = f"{token_data.get('symbol', '').upper()}/USDT"
         order_book_score, order_book_comment = self._score_order_book(ticker_symbol, weights['order_book'])
         
@@ -31,7 +40,10 @@ class ScoringEngine:
         )
         
         logging.info(f"Scoring for {token_data['symbol']}: TOTAL={total_score:.1f} (Regime: {regime})")
-        return total_score, analysis_comments
+        
+        # 正常終了時も、必ず3つの値を返す
+        return total_score, series, analysis_comments
+        # --- ▲▲▲ ここまで ▲▲▲ ---
 
     def _score_technical(self, series, max_score):
         try:
@@ -61,7 +73,6 @@ class ScoringEngine:
 
     def _score_sentiment(self, fng_data, max_score):
         if not fng_data: return 0, f"🧠 センチメント (0/{max_score}点)\nデータなし。"
-        # 逆張り指標：市場が恐怖なら高スコア
         score = (100 - fng_data['value']) / 100 * max_score
         return score, f"🧠 センチメント ({score:.1f}/{max_score}点)\n市場心理は「{fng_data['sentiment']}」。"
 
