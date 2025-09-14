@@ -134,22 +134,19 @@ def admin_panel():
 
 @app.route('/status')
 def position_status_page():
-    # 1. 最新の残高を取得
     total_balance = trader.get_account_balance_usd() or 0.0
     
-    # 2. 市場レジームを判断
     btc_series = data_agg.get_historical_data('BTC-USD', '1y')
-    market_regime = 'N/A' if btc_series is None or btc_series.empty else regime_detector.get_market_regime(btc_series)
-
-    # 3. センチメント指数を取得
+    market_regime = 'データ取得失敗'
+    analysis_comments = "市場データの取得に失敗したため、分析できません。"
     sentiment_data = sentiment_analyzer.get_fear_and_greed_index() or {'value': 'N/A', 'sentiment': 'Unknown'}
-
-    # 4. 市場を代表するBTCのスコアと分析コメントを取得
-    _, _, analysis_comments = scorer.calculate_total_score(
-        {'symbol': 'BTC', 'id': 'bitcoin'}, btc_series, sentiment_data, market_regime
-    )
     
-    # 5. ポジション情報を取得・整形
+    if btc_series is not None and not btc_series.empty:
+        market_regime = regime_detector.get_market_regime(btc_series)
+        _, _, analysis_comments = scorer.calculate_total_score(
+            {'symbol': 'BTC', 'id': 'bitcoin'}, btc_series, sentiment_data, market_regime
+        )
+    
     active_positions = state.get_all_positions()
     enriched_positions = []
     if active_positions:
@@ -162,7 +159,6 @@ def position_status_page():
                 details['pnl_percent'] = (price / details['entry_price'] - 1) * 100
                 enriched_positions.append(details)
                 
-    # 6. 全ての情報をHTMLテンプレートに渡してページを生成
     return render_template_string(
         STATUS_PAGE_HTML, 
         positions=enriched_positions, 
@@ -179,8 +175,6 @@ def retrain_model():
         return jsonify({"error": "Unauthorized"}), 401
     logging.info("Remote retraining process triggered.")
     # TODO: 実際の再学習ロジックを非同期で呼び出す
-    # training_thread = threading.Thread(target=ml_model.run_daily_retraining, args=(db_engine, data_agg))
-    # training_thread.start()
     return jsonify({"message": "Model retraining process started."}), 202
 
 # --- 5. メインの取引・通知ロジック ---
@@ -210,7 +204,7 @@ def run_trading_cycle():
     # フェーズ3: 新規シグナルの生成
     btc_series = data_agg.get_historical_data('BTC-USD', '1y')
     if btc_series is None or btc_series.empty:
-        logging.warning("Could not fetch BTC data. Skipping signal generation.")
+        logging.warning("Could not fetch BTC data for analysis. Skipping this trading cycle.")
         return
 
     market_regime = regime_detector.get_market_regime(btc_series)
@@ -223,7 +217,9 @@ def run_trading_cycle():
     for token in candidate_tokens:
         if state.has_position(token['id']): continue
         yf_ticker = f"{token['symbol'].upper()}-USD"
-        score, series, _ = scorer.calculate_total_score(token, yf_ticker, fng_data, market_regime)
+        series = data_agg.get_historical_data(yf_ticker, '1y')
+        score, _ = scorer.calculate_total_score(token, series, fng_data, market_regime)
+        logging.info(f"Analysis complete for {yf_ticker}. Score: {score:.2f}")
         if score >= entry_threshold:
             signal_details = {
                 'score': score, 'series': series, 'entry_price': series['close'].iloc[-1],
