@@ -5,10 +5,9 @@ import time
 import logging
 import asyncio
 import atexit
-import schedule
-import pytz
 from flask import Flask, render_template_string
 import pandas as pd
+import pandas_ta as ta
 
 # --- 1. モジュールと設定をインポート ---
 import config
@@ -31,12 +30,10 @@ notifier = TelegramNotifier()
 app = Flask(__name__)
 
 # --- 3. 永続化とWebサーバー機能 ---
-# プログラム終了時に状態をファイルに保存する
 atexit.register(state.save_state_to_disk)
 
 @app.route('/')
 def health_check():
-    """RenderのヘルスチェックやUptimeRobotからのアクセスに応答"""
     bot_status = 'ACTIVE' if config.IS_BOT_ACTIVE else 'INACTIVE'
     position_count = len(state.get_all_active_positions())
     return f"✅ Auto Trading Bot is {bot_status}. Active Positions: {position_count}"
@@ -52,6 +49,7 @@ def status_dashboard():
     btc_series = data_agg.fetch_ohlcv(config.MARKET_CONTEXT_TICKER, '90d', '1d')
     market_regime, analysis_comments = "N/A", "BTCデータの取得に失敗しました。"
     if not btc_series.empty:
+        btc_series.ta.atr(append=True)
         _, analysis_comments, market_regime = scorer.generate_score_and_analysis(
             {'symbol': 'BTC', 'id': 'bitcoin'}, btc_series, {'value': fng_value, 'sentiment': fng_sentiment}, 'LONG'
         )
@@ -67,7 +65,7 @@ def status_dashboard():
                 if details['side'] == 'long':
                     pnl = (price - details['entry_price']) * size
                     pnl_percent = (price / details['entry_price'] - 1) * 100 if details['entry_price'] else 0
-                else: # short
+                else:
                     pnl = (details['entry_price'] - price) * size
                     pnl_percent = (details['entry_price'] / price - 1) * 100 if price else 0
             details['pnl'], details['pnl_percent'] = pnl, pnl_percent
@@ -104,22 +102,29 @@ async def run_trading_cycle_async():
     if btc_series_daily.empty:
         logging.error("Could not fetch BTC data for market context. Aborting cycle.")
         return
+    
+    # ATRを計算する命令を明確に追加
     btc_series_daily.ta.atr(append=True)
+    
     volatility = btc_series_daily['ATRp_14'].iloc[-1]
     time_frame = {'period': '7d', 'interval': '1h'} if volatility > 4.0 else {'period': '60d', 'interval': '4h'}
     logging.info(f"Volatility detected (BTC ATRp: {volatility:.2f}%). Using {'SHORT' if volatility > 4.0 else 'MID'}-TERM analysis.")
+    
     all_data = data_agg.get_all_chains_data()
     if all_data.empty: return
     safe_data = risk_filter.filter_risky_tokens(all_data)
     long_df, short_df, _, _ = analyzer.run_analysis(safe_data)
+    
     candidates_map = {}
     def add_candidate(token, signal_type):
         candidates_map.setdefault(token['id'], {'token': token, 'signals': set()})['signals'].add(signal_type)
+
     watchlist_ids = state.get_watchlist().keys()
     for _, token in safe_data[safe_data['id'].isin(watchlist_ids)].iterrows():
         add_candidate(token.to_dict(), 'LONG' if token['price_change_24h'] > 0 else 'SHORT')
     for _, token in long_df.head(config.CANDIDATE_POOL_SIZE).iterrows(): add_candidate(token.to_dict(), 'LONG')
     for _, token in short_df.head(config.CANDIDATE_POOL_SIZE).iterrows(): add_candidate(token.to_dict(), 'SHORT')
+    
     tasks = [analyze_candidate_async(data['token'], stype, {'value': fng_data, 'sentiment': fng_sentiment}, time_frame) for data in candidates_map.values() for stype in data['signals']]
     if tasks:
         logging.info(f"Analyzing {len(tasks)} potential signals concurrently...")
@@ -141,35 +146,25 @@ async def run_trading_cycle_async():
 
 # --- 5. スケジューラと非同期イベントループ ---
 def run_scheduler_sync():
-    """同期的なスケジューラーループ"""
-    # この関数は非同期タスクを呼び出すトリガーとして機能
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
-    # スケジュールジョブを定義
     for t in config.TRADING_CYCLE_TIMES:
         schedule.every().day.at(t, "Asia/Tokyo").do(lambda: loop.run_until_complete(run_trading_cycle_async_wrapper()))
-    
     while True:
         schedule.run_pending()
         time.sleep(1)
 
 async def run_trading_cycle_async_wrapper():
-    """run_trading_cycle_asyncを呼び出し、サイクル完了時に状態を保存"""
     try:
         await run_trading_cycle_async()
     finally:
         state.save_state_to_disk()
 
 # --- 6. プログラムの起動 ---
-# Gunicornがこのファイルをインポートすると、以下のコードが実行される
 logging.info("Initializing Bot...")
-# BOTの起動時に一度だけ状態をファイルから読み込む
 state.load_state_from_disk()
-# BOTのメインロジック(スケジューラ)をバックグラウンドスレッドで実行
 threading.Thread(target=run_scheduler_sync, daemon=True).start()
 
-# ローカルテスト用の起動ブロック
 if __name__ == "__main__":
     logging.info("Starting Flask server for local testing...")
     port = int(os.environ.get("PORT", 8080))
