@@ -1,65 +1,50 @@
-import logging
-import ccxt
-from config import EXCHANGE_ID, EXCHANGE_API_KEY, EXCHANGE_SECRET_KEY, EXCHANGE_API_PASSPHRASE, PAPER_TRADING_ENABLED
+# trading_executor.py (抜粋)
 
 class TradingExecutor:
-    def __init__(self, state):
-        self.state = state
-        self.exchange = None
-        try:
-            cls = getattr(ccxt, EXCHANGE_ID)
-            cfg = {'apiKey': EXCHANGE_API_KEY, 'secret': EXCHANGE_SECRET_KEY}
-            if EXCHANGE_API_PASSPHRASE:
-                cfg['password'] = EXCHANGE_API_PASSPHRASE
-            self.exchange = cls(cfg)
-            self.exchange.load_markets()
-            logging.info(f"TradingExecutor initialized on {EXCHANGE_ID}")
-        except Exception as e:
-            logging.error("Exchange init fail: %s", e)
-            self.exchange = None
+    def __init__(self, state_manager):
+        import ccxt
+        self.exchange = ccxt.bitget({
+            "apiKey": os.getenv("BITGET_API_KEY"),
+            "secret": os.getenv("BITGET_API_SECRET"),
+            "password": os.getenv("BITGET_API_PASSPHRASE"),
+            "enableRateLimit": True,
+        })
+        self.state = state_manager
 
-    def calculate_position_size_usd(self, score, base_usd=50, max_usd=500):
-        # example mapping
-        if score < 50: return 0
-        return min(max_usd, base_usd + (score-50)/50 * (max_usd-base_usd))
-
-    def open_position(self, side, symbol, position_size_usd, notifier=None):
-        """Place market order. side = 'LONG' or 'SHORT'"""
-        if PAPER_TRADING_ENABLED or not self.exchange:
-            logging.info(f"[PAPER] Open {side} {symbol} size ${position_size_usd}")
-            # simulate
-            self.state.set_position(symbol, {"side": side, "entry_time": None, "position_size_usd": position_size_usd})
-            return True
+    def open_position(self, side, symbol, series, score, notifier, analysis_comment, position_size_usd, market_type="spot"):
+        """
+        side: "LONG" or "SHORT"
+        market_type: "spot" or "futures"
+        """
         try:
-            # For spot: buy = market buy, sell = market sell
-            # For futures: API params differ; real implementation required per exchange
-            price = self.exchange.fetch_ticker(symbol).get('last')
-            amount = position_size_usd / price if price else 0
-            if side == 'LONG':
+            # switch defaultType
+            if market_type == "spot":
+                self.exchange.options["defaultType"] = "spot"
+            elif market_type == "futures":
+                self.exchange.options["defaultType"] = "swap"
+            else:
+                raise ValueError("market_type must be spot or futures")
+
+            # decide amount (simplified)
+            price = float(series['close'].iloc[-1]) if not series.empty else self.exchange.fetch_ticker(symbol)["last"]
+            amount = round(position_size_usd / price, 6)
+
+            if side == "LONG":
                 order = self.exchange.create_market_buy_order(symbol, amount)
             else:
                 order = self.exchange.create_market_sell_order(symbol, amount)
-            logging.info("Order placed %s", order)
-            self.state.set_position(symbol, {"side": side, "entry_price": price, "amt": amount})
-            return True
-        except Exception as e:
-            logging.error("Order failed: %s", e)
-            if notifier:
-                notifier.send(f"Order failed for {symbol}: {e}")
-            return False
 
-    def close_position(self, symbol, notifier=None):
-        # simplified: close and record PnL if possible; implement properly per exchange
-        if PAPER_TRADING_ENABLED or not self.exchange:
-            logging.info(f"[PAPER] Close {symbol}")
-            self.state.remove_position(symbol)
-            return True
-        try:
-            details = self.state.get_positions().get(symbol)
-            if not details: return False
-            # implement exchange-specific close
-            self.state.remove_position(symbol)
-            return True
+            # record to state
+            self.state.add_position(symbol, {
+                "side": side,
+                "amount": amount,
+                "entry_price": price,
+                "market_type": market_type,
+                "comment": analysis_comment,
+            })
+
+            notifier.send(f"<b>注文成功</b> ✅ {symbol} | {market_type.upper()} {side} | Size: ${position_size_usd:.2f}")
+            return order
         except Exception as e:
-            logging.error("Close failed: %s", e)
-            return False
+            notifier.send(f"<b>注文失敗</b> ❌ {symbol} | {market_type.upper()} {side} | Error: {e}")
+            raise
