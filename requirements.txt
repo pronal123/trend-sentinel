@@ -1,16 +1,15 @@
 # requirements.txt
 Flask
 gunicorn
-pycoingecko
-pandas
-python-telegram-bot
+python-dotenv
 schedule
 pytz
-ccxt
-python-dotenv
-pandas-ta
 requests
+ccxt
+pandas
+pandas-ta
+yfinance
+pycoingecko
 SQLAlchemy
 psycopg2-binary
 scikit-learn
-yfinance # <--- この行を追加
