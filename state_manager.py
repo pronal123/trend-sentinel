@@ -1,105 +1,122 @@
 # state_manager.py
-import time
-import logging
 import json
 import os
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
 
 class StateManager:
     """
-    BOTの状態（ポジション、通知履歴、取引結果など）を一元管理し、
-    ファイルへの保存・復元を行うクラス。
+    シンプルな state 管理（ファイル永続化付き）。
+    - positions: dict[token_id] = details
+    - trade_history: list of {'time','token_id','result'} where result is 'win'/'loss'
+    - win_rate_history: list of {'time','value'}
     """
-    def __init__(self, state_file='bot_state.json', notification_interval_hours=6):
-        self.state_file = state_file
-        self.notification_interval = notification_interval_hours * 3600  # 時間を秒に変換
-        
-        # BOTの状態を保持する変数
-        self.notified_tokens = {}  # {'token_symbol': timestamp}
-        self.positions = {}        # {'coingecko_id': {'active': True/False, 'details': {...}}}
-        self.trade_history = {'wins': 0, 'losses': 0}
-        self.watchlist = {}        # {'token_id': {'score': 75, 'last_seen': timestamp}}
-        
-        logging.info("StateManager initialized.")
 
+    def __init__(self, filename="bot_state.json"):
+        self.filename = filename
+        self._state = {
+            "positions": {},
+            "trade_history": [],
+            "win_rate_history": []
+        }
+        self.load_state_from_disk()
+
+    # -----------------------
+    # Persistence
+    # -----------------------
     def save_state_to_disk(self):
-        """現在のBOTの全ての状態をJSONファイルに保存する"""
         try:
-            state_data = {
-                'positions': self.positions,
-                'notified_tokens': self.notified_tokens,
-                'trade_history': self.trade_history,
-                'watchlist': self.watchlist
-            }
-            with open(self.state_file, 'w') as f:
-                json.dump(state_data, f, indent=2)
-            logging.info(f"Successfully saved state to {self.state_file}")
+            with open(self.filename, "w", encoding="utf-8") as f:
+                json.dump(self._state, f, ensure_ascii=False, indent=2)
+            logger.info(f"Successfully saved state to {self.filename}")
         except Exception as e:
-            logging.error(f"Failed to save state: {e}")
+            logger.error(f"Failed to save state to disk: {e}")
 
     def load_state_from_disk(self):
-        """ファイルからBOTの状態を復元する"""
-        if not os.path.exists(self.state_file):
-            logging.warning(f"State file '{self.state_file}' not found. Starting with a fresh state.")
+        if not os.path.exists(self.filename):
+            logger.info(f"State file '{self.filename}' not found. Starting with a fresh state.")
             return
         try:
-            with open(self.state_file, 'r') as f:
-                state_data = json.load(f)
-            self.positions = state_data.get('positions', {})
-            self.notified_tokens = state_data.get('notified_tokens', {})
-            self.trade_history = state_data.get('trade_history', {'wins': 0, 'losses': 0})
-            self.watchlist = state_data.get('watchlist', {})
-            logging.info(f"Successfully loaded state from {self.state_file}. Active Positions: {len(self.get_all_active_positions())}")
+            with open(self.filename, "r", encoding="utf-8") as f:
+                self._state = json.load(f)
+            logger.info(f"State loaded from {self.filename}")
         except Exception as e:
-            logging.error(f"Failed to load state: {e}")
+            logger.error(f"Failed to load state file: {e}")
 
-    # --- 通知管理 ---
-    def can_notify(self, token_symbol):
-        last_notified = self.notified_tokens.get(token_symbol)
-        if not last_notified:
-            return True
-        return (time.time() - last_notified) > self.notification_interval
+    # -----------------------
+    # Positions
+    # -----------------------
+    def set_position(self, token_id, active, details=None):
+        """
+        details is a dict like {'ticker':..., 'side': 'long', 'entry_price':..., ...}
+        if active == False, details may be None and position will be removed
+        """
+        if active:
+            self._state["positions"][token_id] = details or {}
+        else:
+            if token_id in self._state["positions"]:
+                del self._state["positions"][token_id]
+        self.save_state_to_disk()
 
-    def record_notification(self, df):
-        for symbol in df['symbol']:
-            self.notified_tokens[symbol] = time.time()
-            
-    # --- ポジション管理 ---
     def has_position(self, token_id):
-        return self.positions.get(token_id, {}).get('active', False)
-
-    def set_position(self, token_id, is_active, details=None):
-        self.positions[token_id] = {'active': is_active, 'details': details}
-        logging.info(f"Position for {token_id} set to active={is_active}.")
+        return token_id in self._state.get("positions", {})
 
     def get_position_details(self, token_id):
-        return self.positions.get(token_id, {}).get('details')
+        return self._state.get("positions", {}).get(token_id)
 
     def get_all_active_positions(self):
-        return {token_id: pos['details'] for token_id, pos in self.positions.items() if pos.get('active')}
+        return self._state.get("positions", {})
 
-    # --- 取引結果と勝率 ---
+    # -----------------------
+    # Trade history & win rate
+    # -----------------------
     def record_trade_result(self, token_id, result):
-        if result == 'win':
-            self.trade_history['wins'] += 1
-        else:
-            self.trade_history['losses'] += 1
-        logging.info(f"Trade result recorded for {token_id}: {result}. Current stats: {self.trade_history}")
-        
+        """
+        result: 'win' or 'loss'
+        """
+        now = datetime.utcnow().isoformat() + "Z"
+        self._state.setdefault("trade_history", []).append({
+            "time": now,
+            "token_id": token_id,
+            "result": result
+        })
+        # update win rate snapshot
+        self._update_win_rate_history()
+        self.save_state_to_disk()
+
+    def _update_win_rate_history(self):
+        # compute current win rate from trade_history and append a snapshot
+        history = self._state.get("trade_history", [])
+        wins = sum(1 for t in history if t.get("result") == "win")
+        total = len(history)
+        rate = round((wins / total) * 100, 2) if total > 0 else 0.0
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        self._state.setdefault("win_rate_history", []).append({
+            "time": now,
+            "value": rate
+        })
+
     def get_win_rate(self):
-        total_trades = self.trade_history['wins'] + self.trade_history['losses']
-        if total_trades == 0:
-            return 50.0 # 取引履歴がない場合はデフォルト50%
-        return (self.trade_history['wins'] / total_trades) * 100
+        # latest value if exists, else compute from trade_history
+        wr_hist = self._state.get("win_rate_history", [])
+        if wr_hist:
+            return wr_hist[-1].get("value", 0.0)
+        # fallback compute
+        history = self._state.get("trade_history", [])
+        wins = sum(1 for t in history if t.get("result") == "win")
+        total = len(history)
+        return round((wins / total) * 100, 2) if total > 0 else 0.0
 
-    # --- ウォッチリスト管理 ---
-    def update_watchlist(self, token_id, score):
-        self.watchlist[token_id] = {'score': score, 'last_seen': time.time()}
+    def get_win_rate_history(self):
+        hist = self._state.get("win_rate_history", [])
+        return {"timestamps": [h["time"] for h in hist], "values": [h["value"] for h in hist]}
 
-    def get_watchlist(self):
-        current_time = time.time()
-        # 24時間以上更新がないものはウォッチリストから削除
-        self.watchlist = {
-            tid: data for tid, data in self.watchlist.items() 
-            if current_time - data['last_seen'] < 86400 
-        }
-        return self.watchlist
+    # -----------------------
+    # Utility for debugging
+    # -----------------------
+    def reset_state(self):
+        self._state = {"positions": {}, "trade_history": [], "win_rate_history": []}
+        self.save_state_to_disk()
