@@ -10,6 +10,3 @@ pandas
 pandas-ta
 yfinance
 pycoingecko
-SQLAlchemy
-psycopg2-binary
-scikit-learn
