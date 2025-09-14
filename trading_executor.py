@@ -1,71 +1,102 @@
 import os
-import ccxt
+import hmac
+import hashlib
+import time
+import requests
 import logging
 
 class TradingExecutor:
-    def __init__(self, state_manager):
-        self.state_manager = state_manager
+    BASE_URL = "https://api.bitget.com"
 
-        # Spot
-        self.enable_spot = os.getenv("ENABLE_SPOT", "false").lower() == "true"
-        if self.enable_spot:
-            self.spot_client = ccxt.bitget({
-                "apiKey": os.getenv("BITGET_SPOT_API_KEY"),
-                "secret": os.getenv("BITGET_SPOT_API_SECRET"),
-                "password": os.getenv("BITGET_SPOT_API_PASSPHRASE"),
-                "options": {"defaultType": "spot"},
-            })
-            logging.info("✅ Spot client initialized")
-        else:
-            self.spot_client = None
-            logging.info("⚠️ Spot client disabled")
+    def __init__(self):
+        self.api_key = os.getenv("BITGET_API_KEY")
+        self.secret = os.getenv("BITGET_API_SECRET")
+        self.passphrase = os.getenv("BITGET_API_PASSPHRASE")
+        self.account_type = os.getenv("BITGET_ACCOUNT_TYPE", "spot")  # spot or futures
 
-        # Futures
-        self.enable_futures = os.getenv("ENABLE_FUTURES", "false").lower() == "true"
-        if self.enable_futures:
-            self.futures_client = ccxt.bitget({
-                "apiKey": os.getenv("BITGET_FUTURES_API_KEY"),
-                "secret": os.getenv("BITGET_FUTURES_API_SECRET"),
-                "password": os.getenv("BITGET_FUTURES_API_PASSPHRASE"),
-                "options": {"defaultType": "swap"},
-            })
-            logging.info("✅ Futures client initialized")
-        else:
-            self.futures_client = None
-            logging.info("⚠️ Futures client disabled")
+        if not all([self.api_key, self.secret, self.passphrase]):
+            raise ValueError("Bitget API認証情報が不足しています (.env を確認してください)")
 
-    def open_position(self, side, symbol, series, score, notifier, analysis_comment,
-                      position_size_usd=100, market_type="spot"):
+    def _sign(self, method: str, endpoint: str, params: str = ""):
+        ts = str(int(time.time() * 1000))
+        prehash = ts + method + endpoint + params
+        sign = hmac.new(self.secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).hexdigest()
+        return ts, sign
 
-        if market_type == "spot":
-            if not self.enable_spot or not self.spot_client:
-                logging.warning("Spot trading disabled")
-                return None
-            client = self.spot_client
+    def _headers(self, method: str, endpoint: str, params: str = ""):
+        ts, sign = self._sign(method, endpoint, params)
+        return {
+            "ACCESS-KEY": self.api_key,
+            "ACCESS-SIGN": sign,
+            "ACCESS-TIMESTAMP": ts,
+            "ACCESS-PASSPHRASE": self.passphrase,
+            "Content-Type": "application/json"
+        }
 
-        elif market_type == "futures":
-            if not self.enable_futures or not self.futures_client:
-                logging.warning("Futures trading disabled")
-                return None
-            client = self.futures_client
+    def place_order(self, symbol: str, side: str, size: float, price: float = None, leverage: int = 1):
+        """
+        side: buy/sell
+        size: 注文数量
+        price: Noneなら成行
+        leverage: 先物の場合のレバレッジ
+        """
+        if self.account_type == "spot":
+            endpoint = "/api/spot/v1/trade/orders"
+            url = self.BASE_URL + endpoint
+            data = {
+                "symbol": symbol,
+                "side": side,
+                "orderType": "limit" if price else "market",
+                "force": "gtc",
+                "price": str(price) if price else "",
+                "quantity": str(size)
+            }
+        else:  # futures
+            endpoint = "/api/mix/v1/order/placeOrder"
+            url = self.BASE_URL + endpoint
+            data = {
+                "symbol": symbol,
+                "marginCoin": "USDT",
+                "side": "open_long" if side == "buy" else "open_short",
+                "orderType": "limit" if price else "market",
+                "price": str(price) if price else "",
+                "size": str(size),
+                "leverage": str(leverage),
+                "timeInForceValue": "normal"
+            }
 
-        else:
-            logging.error(f"Unknown market_type={market_type}")
+        headers = self._headers("POST", endpoint, "")
+        try:
+            r = requests.post(url, headers=headers, json=data, timeout=10)
+            res = r.json()
+            logging.info(f"Order response: {res}")
+            return res
+        except Exception as e:
+            logging.error(f"注文エラー: {e}")
             return None
 
-        # --- 発注処理例 ---
+    def close_position(self, symbol: str, side: str, size: float):
+        """ 先物ポジションのクローズ """
+        if self.account_type != "futures":
+            logging.warning("close_position は futures アカウントのみ対応")
+            return None
+
+        endpoint = "/api/mix/v1/order/placeOrder"
+        url = self.BASE_URL + endpoint
+        data = {
+            "symbol": symbol,
+            "marginCoin": "USDT",
+            "side": "close_long" if side == "buy" else "close_short",
+            "orderType": "market",
+            "size": str(size),
+            "timeInForceValue": "normal"
+        }
+        headers = self._headers("POST", endpoint, "")
         try:
-            if side == "LONG":
-                order = client.create_market_buy_order(symbol, 0.001)  # ⚠️ size計算は別途
-            elif side == "SHORT":
-                order = client.create_market_sell_order(symbol, 0.001)
-            else:
-                logging.error(f"Invalid side={side}")
-                return None
-
-            logging.info(f"✅ Order executed {market_type} {side}: {order}")
-            return order
-
+            r = requests.post(url, headers=headers, json=data, timeout=10)
+            res = r.json()
+            logging.info(f"Close response: {res}")
+            return res
         except Exception as e:
-            logging.error(f"注文失敗 ({market_type} {side}): {e}")
+            logging.error(f"クローズ注文エラー: {e}")
             return None
