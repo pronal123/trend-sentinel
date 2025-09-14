@@ -1,119 +1,75 @@
 import json
 import os
+import datetime
 import logging
-from datetime import datetime
-import pytz
-
-STATE_FILE = "bot_state.json"
 
 
 class StateManager:
-    def __init__(self):
+    def __init__(self, state_file="bot_state.json"):
+        self.state_file = state_file
         self.state = {
-            "balance": 10000.0,  # 初期残高 (USDT)
+            "balance": 10000.0,
             "positions": {},
-            "win_rate": 0.0,
-            "trade_results": [],
             "summary": {},
             "balance_history": [],
-            "daily_returns": {}
+            "daily_returns": {},
+            "trade_history": []  # 直近1000件保持
         }
         self.load_state()
 
+    # -------------------------
+    # 状態ロード/セーブ
+    # -------------------------
     def load_state(self):
-        """JSONファイルから状態を読み込む"""
-        if os.path.exists(STATE_FILE):
+        if os.path.exists(self.state_file):
             try:
-                with open(STATE_FILE, "r") as f:
+                with open(self.state_file, "r") as f:
                     self.state = json.load(f)
-                logging.info("State loaded successfully.")
             except Exception as e:
                 logging.error(f"Failed to load state: {e}")
 
     def save_state(self):
-        """状態をJSONファイルに保存する"""
         try:
-            with open(STATE_FILE, "w") as f:
+            with open(self.state_file, "w") as f:
                 json.dump(self.state, f, indent=2)
         except Exception as e:
             logging.error(f"Failed to save state: {e}")
 
-    # -------------------------------
-    # ポジション管理
-    # -------------------------------
-    def has_position(self, token_id):
-        return token_id in self.state["positions"]
+    # -------------------------
+    # トレード結果記録
+    # -------------------------
+    def record_trade_result(self, symbol, side, pnl, balance):
+        now = datetime.datetime.now().isoformat()
 
-    def set_position(self, token_id, is_open, details=None):
-        if is_open:
-            self.state["positions"][token_id] = details or {}
-        else:
-            self.state["positions"].pop(token_id, None)
+        trade = {
+            "timestamp": now,
+            "symbol": symbol,
+            "side": side,
+            "pnl": float(pnl),
+            "balance": float(balance),
+            "return_pct": (pnl / balance * 100) if balance > 0 else 0.0,
+        }
 
-    def get_position_details(self, token_id):
-        return self.state["positions"].get(token_id)
+        # trade_history に追加（直近1000件）
+        self.state.setdefault("trade_history", [])
+        self.state["trade_history"].append(trade)
+        if len(self.state["trade_history"]) > 1000:
+            self.state["trade_history"] = self.state["trade_history"][-1000:]
 
-    def get_all_active_positions(self):
-        return self.state["positions"]
-
-    # -------------------------------
-    # トレード履歴と勝率管理
-    # -------------------------------
-    def record_trade_result(self, token_id, result, pnl=0.0):
-        """トレード結果を記録し、勝率と残高を更新する"""
-        timestamp = datetime.now(pytz.timezone("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M:%S")
-        self.state["trade_results"].append({"token": token_id, "result": result, "pnl": pnl, "time": timestamp})
-
-        # 残高更新
-        self.state["balance"] += pnl
-
-        # バランス履歴更新
+        # balance と履歴
+        self.state["balance"] = float(balance)
+        self.state.setdefault("balance_history", [])
         self.state["balance_history"].append({
-            "time": timestamp,
-            "balance": self.state["balance"]
+            "timestamp": now,
+            "balance": float(balance)
         })
-
-        # 勝率更新
-        wins = sum(1 for t in self.state["trade_results"] if t["result"] == "win")
-        total = len(self.state["trade_results"])
-        self.state["win_rate"] = (wins / total) * 100 if total > 0 else 0.0
-
-        # 日次リターン集計
-        today = datetime.now(pytz.timezone("Asia/Tokyo")).strftime("%Y-%m-%d")
-        if today not in self.state["daily_returns"]:
-            self.state["daily_returns"][today] = {"pnl_usdt": 0.0, "return_pct": 0.0}
-
-        self.state["daily_returns"][today]["pnl_usdt"] += pnl
-        start_balance = 10000.0
-        if len(self.state["balance_history"]) > 1:
-            start_balance = self.state["balance_history"][0]["balance"]
-        current_balance = self.state["balance"]
-        self.state["daily_returns"][today]["return_pct"] = round(
-            (current_balance - start_balance) / start_balance * 100, 2
-        )
+        if len(self.state["balance_history"]) > 2000:
+            self.state["balance_history"] = self.state["balance_history"][-2000:]
 
         self.save_state()
 
-    def get_win_rate(self):
-        return self.state.get("win_rate", 0.0)
-
-    # -------------------------------
-    # サマリー更新
-    # -------------------------------
-    def update_summary(self, summary_dict):
-        self.state["summary"] = summary_dict
-
-    # -------------------------------
-    # /status 用スナップショット
-    # -------------------------------
+    # -------------------------
+    # スナップショット取得
+    # -------------------------
     def get_state_snapshot(self):
-        """/status で返すデータをまとめて取得"""
-        return {
-            "balance": self.state.get("balance", 0.0),
-            "win_rate": self.state.get("win_rate", 0.0),
-            "positions": self.state.get("positions", {}),
-            "summary": self.state.get("summary", {}),
-            "balance_history": self.state.get("balance_history", []),
-            "daily_returns": self.state.get("daily_returns", {}),
-            "trade_results": self.state.get("trade_results", [])
-        }
+        return self.state
