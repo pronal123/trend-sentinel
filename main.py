@@ -36,6 +36,7 @@ atexit.register(state.save_state_to_disk)
 
 @app.route('/')
 def health_check():
+    """RenderのヘルスチェックやUptimeRobotからのアクセスに応答"""
     bot_status = 'ACTIVE' if config.IS_BOT_ACTIVE else 'INACTIVE'
     position_count = len(state.get_all_active_positions())
     return f"✅ Auto Trading Bot is {bot_status}. Active Positions: {position_count}"
@@ -51,7 +52,6 @@ def status_dashboard():
     btc_series = data_agg.fetch_ohlcv(config.MARKET_CONTEXT_TICKER, '90d', '1d')
     market_regime, analysis_comments = "N/A", "BTCデータの取得に失敗しました。"
     if not btc_series.empty:
-        btc_series.ta.atr(append=True)
         _, analysis_comments, market_regime = scorer.generate_score_and_analysis(
             {'symbol': 'BTC', 'id': 'bitcoin'}, btc_series, {'value': fng_value, 'sentiment': fng_sentiment}, 'LONG'
         )
@@ -67,7 +67,7 @@ def status_dashboard():
                 if details['side'] == 'long':
                     pnl = (price - details['entry_price']) * size
                     pnl_percent = (price / details['entry_price'] - 1) * 100 if details['entry_price'] else 0
-                else:
+                else: # short
                     pnl = (details['entry_price'] - price) * size
                     pnl_percent = (details['entry_price'] / price - 1) * 100 if price else 0
             details['pnl'], details['pnl_percent'] = pnl, pnl_percent
@@ -104,13 +104,17 @@ async def run_trading_cycle_async():
     if btc_series_daily.empty:
         logging.error("Could not fetch BTC data for market context. Aborting cycle.")
         return
+
+    # ATRの代わりにボリンジャーバンドの幅でボラティリティを判断
+    btc_series_daily.ta.bbands(append=True)
+    bbw = btc_series_daily['BBB_20_2.0'].iloc[-1]
     
-    # ATRを計算する命令を明確に追加
-    btc_series_daily.ta.atr(append=True)
-    
-    volatility = btc_series_daily['ATRp_14'].iloc[-1]
-    time_frame = {'period': '7d', 'interval': '1h'} if volatility > 4.0 else {'period': '60d', 'interval': '4h'}
-    logging.info(f"Volatility detected (BTC ATRp: {volatility:.2f}%). Using {'SHORT' if volatility > 4.0 else 'MID'}-TERM analysis.")
+    if bbw > 4.0: # バンド幅が4%以上なら高ボラティリティ
+        time_frame = {'period': '7d', 'interval': '1h'}
+        logging.info(f"High volatility detected (Bollinger Band Width: {bbw:.2f}%). Using SHORT-TERM (1h) analysis.")
+    else:
+        time_frame = {'period': '60d', 'interval': '4h'}
+        logging.info(f"Low volatility detected (Bollinger Band Width: {bbw:.2f}%). Using MID-TERM (4h) analysis.")
     
     all_data = data_agg.get_all_chains_data()
     if all_data.empty: return
@@ -154,10 +158,7 @@ def run_scheduler_sync():
         asyncio.set_event_loop(loop)
         for t in config.TRADING_CYCLE_TIMES:
             schedule.every().day.at(t, "Asia/Tokyo").do(lambda: loop.run_until_complete(run_trading_cycle_async_wrapper()))
-        
-        # 日次サマリーのスケジュールを追加
-        schedule.every().day.at(config.DAILY_SUMMARY_TIME, "Asia/Tokyo").do(lambda: notifier.send_daily_summary(data_agg.get_all_chains_data()))
-
+        # TODO: 日次サマリーも同様に追加
         while True:
             schedule.run_pending()
             time.sleep(1)
@@ -171,12 +172,10 @@ async def run_trading_cycle_async_wrapper():
         state.save_state_to_disk()
 
 # --- 6. プログラムの起動 ---
-# Gunicornがファイルをインポートする際に、このトップレベルのコードが実行される
 logging.info("Initializing Bot...")
 state.load_state_from_disk()
 threading.Thread(target=run_scheduler_sync, daemon=True).start()
 
-# ローカル環境で `python main.py` を実行した時のみ、Flaskの開発サーバーを起動
 if __name__ == "__main__":
     logging.info("Starting Flask server for local testing...")
     port = int(os.environ.get("PORT", 8080))
