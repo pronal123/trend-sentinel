@@ -36,7 +36,6 @@ atexit.register(state.save_state_to_disk)
 
 @app.route('/')
 def health_check():
-    """RenderのヘルスチェックやUptimeRobotからのアクセスに応答"""
     bot_status = 'ACTIVE' if config.IS_BOT_ACTIVE else 'INACTIVE'
     position_count = len(state.get_all_active_positions())
     return f"✅ Auto Trading Bot is {bot_status}. Active Positions: {position_count}"
@@ -67,7 +66,7 @@ def status_dashboard():
                 if details['side'] == 'long':
                     pnl = (price - details['entry_price']) * size
                     pnl_percent = (price / details['entry_price'] - 1) * 100 if details['entry_price'] else 0
-                else: # short
+                else:
                     pnl = (details['entry_price'] - price) * size
                     pnl_percent = (details['entry_price'] / price - 1) * 100 if price else 0
             details['pnl'], details['pnl_percent'] = pnl, pnl_percent
@@ -104,17 +103,21 @@ async def run_trading_cycle_async():
     if btc_series_daily.empty:
         logging.error("Could not fetch BTC data for market context. Aborting cycle.")
         return
-
-    # ATRの代わりにボリンジャーバンドの幅でボラティリティを判断
+    
+    # ▼▼▼ ここが代替ロジック ▼▼▼
+    # ボリンジャーバンドを計算
     btc_series_daily.ta.bbands(append=True)
+    # ボリンジャーバンドの幅(%)を取得
     bbw = btc_series_daily['BBB_20_2.0'].iloc[-1]
     
-    if bbw > 4.0: # バンド幅が4%以上なら高ボラティリティ
+    # バンド幅が4%以上なら高ボラティリティと判断
+    if bbw > 4.0:
         time_frame = {'period': '7d', 'interval': '1h'}
         logging.info(f"High volatility detected (Bollinger Band Width: {bbw:.2f}%). Using SHORT-TERM (1h) analysis.")
     else:
         time_frame = {'period': '60d', 'interval': '4h'}
         logging.info(f"Low volatility detected (Bollinger Band Width: {bbw:.2f}%). Using MID-TERM (4h) analysis.")
+    # ▲▲▲ ここまで ▲▲▲
     
     all_data = data_agg.get_all_chains_data()
     if all_data.empty: return
@@ -158,7 +161,10 @@ def run_scheduler_sync():
         asyncio.set_event_loop(loop)
         for t in config.TRADING_CYCLE_TIMES:
             schedule.every().day.at(t, "Asia/Tokyo").do(lambda: loop.run_until_complete(run_trading_cycle_async_wrapper()))
-        # TODO: 日次サマリーも同様に追加
+        
+        # 日次サマリーのスケジュールも追加
+        schedule.every().day.at(config.DAILY_SUMMARY_TIME, "Asia/Tokyo").do(lambda: notifier.send_daily_summary(data_agg.get_all_chains_data()))
+
         while True:
             schedule.run_pending()
             time.sleep(1)
