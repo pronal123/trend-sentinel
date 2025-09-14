@@ -1,95 +1,131 @@
 import json
 import os
-import datetime
-import numpy as np
+import logging
+from datetime import datetime
+import pytz
+
+STATE_FILE = "bot_state.json"
+
 
 class StateManager:
-    def __init__(self, state_file="bot_state.json"):
-        self.state_file = state_file
+    """
+    ボットの状態を永続化・管理するクラス。
+    - ポジション情報
+    - 勝率履歴
+    - 資産曲線
+    - 日次リターン (JST基準)
+    """
+
+    def __init__(self):
         self.state = {
-            "balance": 10000.0,  # 初期残高 USDT
             "positions": {},
-            "win_history": [],
-            "trade_history": [],
-            "equity_curve": [],
+            "trade_history": [],   # 個別トレード履歴
+            "win_history": [],     # 勝敗履歴 (1=勝ち,0=負け)
+            "balance_history": [], # 残高推移
+            "daily_returns": {},   # JST日次ごとの損益
         }
-        self.load_state()
+        self._load_state()
 
-    def load_state(self):
-        if os.path.exists(self.state_file):
+    # -----------------------------
+    # 内部ユーティリティ
+    # -----------------------------
+    def _load_state(self):
+        if os.path.exists(STATE_FILE):
             try:
-                with open(self.state_file, "r") as f:
+                with open(STATE_FILE, "r") as f:
                     self.state = json.load(f)
-            except Exception:
-                pass
+            except Exception as e:
+                logging.error(f"Failed to load state: {e}")
 
-    def save_state(self):
-        with open(self.state_file, "w") as f:
-            json.dump(self.state, f, indent=2)
+    def _save_state(self):
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump(self.state, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logging.error(f"Failed to save state: {e}")
 
-    def get_balance(self):
-        return self.state.get("balance", 0.0)
+    def _get_today_jst(self):
+        """JST基準の日付文字列を返す (YYYY-MM-DD)"""
+        tz = pytz.timezone("Asia/Tokyo")
+        return datetime.now(tz).strftime("%Y-%m-%d")
 
-    def update_balance(self, delta):
-        self.state["balance"] += delta
-        self.state["equity_curve"].append(self.state["balance"])
-        self.save_state()
+    # -----------------------------
+    # ポジション関連
+    # -----------------------------
+    def has_position(self, symbol):
+        return symbol in self.state["positions"]
 
-    def open_position(self, symbol, side, size, price, market_type="spot"):
-        self.state["positions"][symbol] = {
-            "side": side,
-            "size": size,
-            "entry_price": price,
-            "market_type": market_type,
-            "timestamp": datetime.datetime.now().isoformat()
+    def get_position_details(self, symbol):
+        return self.state["positions"].get(symbol)
+
+    def set_position(self, symbol, is_open, details=None):
+        if is_open:
+            self.state["positions"][symbol] = details
+        else:
+            if symbol in self.state["positions"]:
+                del self.state["positions"][symbol]
+        self._save_state()
+
+    def get_all_active_positions(self):
+        return self.state["positions"]
+
+    # -----------------------------
+    # トレード履歴・勝率関連
+    # -----------------------------
+    def record_trade_result(self, symbol, result, pnl, balance):
+        """
+        result: "win" / "loss"
+        pnl: 損益（USDT）
+        balance: 決済後残高（USDT）
+        """
+        today = self._get_today_jst()
+
+        # トレード履歴
+        trade = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "symbol": symbol,
+            "result": result,
+            "pnl": pnl,
+            "balance": balance,
         }
-        self.save_state()
+        self.state["trade_history"].append(trade)
 
-    def close_position(self, symbol, exit_price, pnl, win):
-        if symbol in self.state["positions"]:
-            del self.state["positions"][symbol]
+        # 勝敗履歴
+        self.state["win_history"].append(1 if result == "win" else 0)
 
-        self.update_balance(pnl)
-        self.record_trade_result(win, pnl)
+        # 資産推移
+        self.state["balance_history"].append(
+            {"timestamp": trade["timestamp"], "balance": balance}
+        )
 
-    def record_trade_result(self, win, pnl):
-        self.state["win_history"].append(1 if win else 0)
-        self.state["trade_history"].append(pnl)
-        self.save_state()
+        # 日次リターン更新
+        if today not in self.state["daily_returns"]:
+            self.state["daily_returns"][today] = {"pnl_usdt": 0.0, "return_pct": 0.0}
+
+        self.state["daily_returns"][today]["pnl_usdt"] += pnl
+
+        # 前日残高を基準に日次損益率を計算
+        prev_balance = balance - pnl if balance - pnl > 0 else balance
+        if prev_balance > 0:
+            self.state["daily_returns"][today]["return_pct"] = (
+                self.state["daily_returns"][today]["pnl_usdt"] / prev_balance
+            )
+
+        self._save_state()
 
     def get_win_rate(self):
         if not self.state["win_history"]:
             return 0.0
         return sum(self.state["win_history"]) / len(self.state["win_history"]) * 100
 
-    def get_equity_curve(self):
-        return self.state.get("equity_curve", [])
-
-    def compute_metrics(self):
-        trades = self.state["trade_history"]
-        if not trades:
-            return {
-                "pnl": 0,
-                "max_drawdown": 0,
-                "sharpe_ratio": 0,
-                "profit_factor": 0
-            }
-
-        pnl = sum(trades)
-        equity = np.cumsum(trades)
-        dd = equity - np.maximum.accumulate(equity)
-        max_dd = dd.min() if len(dd) else 0
-
-        returns = np.array(trades)
-        sharpe = (returns.mean() / (returns.std() + 1e-6)) * np.sqrt(252) if len(returns) > 1 else 0
-
-        gains = sum([t for t in trades if t > 0])
-        losses = abs(sum([t for t in trades if t < 0]))
-        pf = (gains / losses) if losses > 0 else float("inf")
-
+    # -----------------------------
+    # 状態取得
+    # -----------------------------
+    def get_state_snapshot(self):
         return {
-            "pnl": pnl,
-            "max_drawdown": float(max_dd),
-            "sharpe_ratio": float(sharpe),
-            "profit_factor": float(pf)
+            "positions": self.state["positions"],
+            "trade_count": len(self.state["trade_history"]),
+            "win_rate": self.get_win_rate(),
+            "balance_history": self.state["balance_history"],
+            "daily_returns": self.state["daily_returns"],
         }
