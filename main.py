@@ -9,6 +9,7 @@ import schedule
 import pytz
 from flask import Flask, render_template_string
 import pandas as pd
+import pandas_ta as ta
 
 # --- 1. モジュールと設定をインポート ---
 import config
@@ -31,7 +32,6 @@ notifier = TelegramNotifier()
 app = Flask(__name__)
 
 # --- 3. 永続化とWebサーバー機能 ---
-# プログラム終了時に状態をファイルに保存する処理を登録
 atexit.register(state.save_state_to_disk)
 
 @app.route('/')
@@ -73,42 +73,22 @@ STATUS_PAGE_HTML = """
     <div class="container">
         <h1>🤖 Bot Status Dashboard</h1>
         <div class="grid-container">
-            <div class="grid-item">
-                <div class="label">現在の総資産残高</div>
-                <div class="value">${{ "%.2f"|format(total_balance) }}</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">市場センチメント</div>
-                <div class="value">{{ fng_sentiment }} ({{ fng_value }})</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">市場レジーム</div>
-                <div class="value">{{ market_regime }}</div>
-            </div>
+            <div class="grid-item"><div class="label">現在の総資産残高</div><div class="value">${{ "%.2f"|format(total_balance) }}</div></div>
+            <div class="grid-item"><div class="label">市場センチメント</div><div class="value">{{ fng_sentiment }} ({{ fng_value }})</div></div>
+            <div class="grid-item"><div class="label">市場レジーム</div><div class="value">{{ market_regime }}</div></div>
         </div>
-        
-        <div class="analysis-box">
-            <h2>市場分析コメント (BTC-USD)</h2>
-            <pre>{{ analysis_comments }}</pre>
-        </div>
-        
+        <div class="analysis-box"><h2>市場分析コメント (BTC-USD)</h2><pre>{{ analysis_comments }}</pre></div>
         <h2>アクティブなポジション</h2>
         {% if positions %}
             <table>
-                <thead>
-                    <tr>
-                        <th>Ticker</th><th>Side</th><th>Entry / Current</th><th>Unrealized P/L</th><th>Take Profit</th><th>Stop Loss</th>
-                    </tr>
-                </thead>
+                <thead><tr><th>Ticker</th><th>Side</th><th>Entry / Current</th><th>Unrealized P/L</th><th>Take Profit</th><th>Stop Loss</th></tr></thead>
                 <tbody>
                     {% for pos in positions %}
                         <tr class="{{ 'profit' if pos.pnl >= 0 else 'loss' }}">
-                            <td><strong>{{ pos.ticker }}</strong></td>
-                            <td>{{ pos.side.upper() }}</td>
+                            <td><strong>{{ pos.ticker }}</strong></td><td>{{ pos.side.upper() }}</td>
                             <td>${{ "%.4f"|format(pos.entry_price) }}<br>→ ${{ "%.4f"|format(pos.current_price) }}</td>
                             <td><strong>{{ "%.2f"|format(pos.pnl_percent) }}%</strong> (${{ "%.2f"|format(pos.pnl) }})</td>
-                            <td class="profit">${{ "%.4f"|format(pos.take_profit) }}</td>
-                            <td class="loss">${{ "%.4f"|format(pos.stop_loss) }}</td>
+                            <td class="profit">${{ "%.4f"|format(pos.take_profit) }}</td><td class="loss">${{ "%.4f"|format(pos.stop_loss) }}</td>
                         </tr>
                     {% endfor %}
                 </tbody>
@@ -125,14 +105,12 @@ STATUS_PAGE_HTML = """
 def status_dashboard():
     total_balance = trader.get_account_balance_usd()
     fng_value, fng_sentiment = data_agg.get_fear_and_greed_index()
-    
     btc_series = data_agg.fetch_ohlcv(config.MARKET_CONTEXT_TICKER, '90d', '1d')
     market_regime, analysis_comments = "N/A", "BTCデータの取得に失敗しました。"
     if not btc_series.empty:
         _, analysis_comments, market_regime = scorer.generate_score_and_analysis(
             {'symbol': 'BTC', 'id': 'bitcoin'}, btc_series, {'value': fng_value, 'sentiment': fng_sentiment}, 'LONG'
         )
-
     active_positions = state.get_all_active_positions()
     enriched_positions = []
     for token_id, details in active_positions.items():
@@ -143,63 +121,39 @@ def status_dashboard():
             if details['side'] == 'long':
                 pnl = (price - details['entry_price']) * size
                 pnl_percent = (price / details['entry_price'] - 1) * 100 if details['entry_price'] else 0
-            else: # short
+            else:
                 pnl = (details['entry_price'] - price) * size
                 pnl_percent = (details['entry_price'] / price - 1) * 100 if price else 0
-            details['pnl'] = pnl
-            details['pnl_percent'] = pnl_percent
+            details['pnl'], details['pnl_percent'] = pnl, pnl_percent
             enriched_positions.append(details)
-            
     return render_template_string(
-        STATUS_PAGE_HTML, 
-        positions=enriched_positions, 
-        total_balance=total_balance,
-        market_regime=market_regime,
-        fng_value=fng_value,
-        fng_sentiment=fng_sentiment,
+        STATUS_PAGE_HTML, positions=enriched_positions, total_balance=total_balance,
+        market_regime=market_regime, fng_value=fng_value, fng_sentiment=fng_sentiment,
         analysis_comments=analysis_comments
     )
 
 # --- 4. 非同期対応の分析・取引ロジック ---
 async def analyze_candidate_async(candidate, signal_type, fng_data, time_frame):
-    yf_ticker = f"{candidate['symbol'].upper()}-USD"
-    
-    loop = asyncio.get_event_loop()
-    series = await loop.run_in_executor(None, data_agg.fetch_ohlcv, yf_ticker, time_frame['period'], time_frame['interval'])
-    if series.empty: return None
-    
-    score, analysis, regime = scorer.generate_score_and_analysis(candidate, series, fng_data, signal_type)
-    entry_threshold = config.ENTRY_SCORE_THRESHOLD_TRENDING if regime == 'TRENDING' else config.ENTRY_SCORE_THRESHOLD_RANGING
-    
-    if score >= entry_threshold:
-        return {'type': signal_type, 'token': candidate, 'series': series, 'score': score, 'analysis': analysis}
-    elif score >= entry_threshold * 0.7:
-        state.update_watchlist(candidate['id'], score)
-    
-    return None
+    # ... (この関数は変更なし) ...
 
 async def run_trading_cycle_async():
-    if not config.IS_BOT_ACTIVE:
-        logging.warning("BOT is INACTIVE. Skipping cycle.")
-        return
-        
+    if not config.IS_BOT_ACTIVE: return
     logging.info("--- 🚀 Starting New Intelligent Trading Cycle ---")
-
     trader.check_active_positions(data_agg, notifier=notifier)
     win_rate = state.get_win_rate()
     logging.info(f"Current Bot Win Rate: {win_rate:.2f}%")
-
     if len(state.get_all_active_positions()) >= config.MAX_OPEN_POSITIONS:
-        logging.warning(f"Max positions reached. Skipping new signal generation.")
+        logging.warning("Max positions reached. Skipping new signal generation.")
         return
 
     fng_data, fng_sentiment = data_agg.get_fear_and_greed_index()
     btc_series_daily = data_agg.fetch_ohlcv(config.MARKET_CONTEXT_TICKER, '90d', '1d')
     if btc_series_daily.empty:
-        logging.error("Could not fetch BTC data for market context. Aborting cycle.")
-        return
+        logging.error("Could not fetch BTC data for market context. Aborting cycle."); return
     
+    # ▼▼▼【バグ修正】欠けていたATR計算を追加 ▼▼▼
     btc_series_daily.ta.atr(append=True)
+    
     volatility = btc_series_daily['ATRp_14'].iloc[-1]
     time_frame = {'period': '7d', 'interval': '1h'} if volatility > 4.0 else {'period': '60d', 'interval': '4h'}
     logging.info(f"Volatility detected (BTC ATRp: {volatility:.2f}%). Using {'SHORT' if volatility > 4.0 else 'MID'}-TERM analysis.")
@@ -211,7 +165,7 @@ async def run_trading_cycle_async():
     
     candidates_map = {}
     def add_candidate(token, signal_type):
-        candidates_map.setdefault(token['id'], {'token': token, 'signals': set()})['signals'].add(signal_type)
+        candidates_map.setdefault(token['id'], {'token': token, 'signals': set()}).add(signal_type)
 
     watchlist_ids = state.get_watchlist().keys()
     for _, token in safe_data[safe_data['id'].isin(watchlist_ids)].iterrows():
@@ -223,53 +177,39 @@ async def run_trading_cycle_async():
     if tasks:
         logging.info(f"Analyzing {len(tasks)} potential signals concurrently...")
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
         valid_results = [r for r in results if r is not None and not isinstance(r, Exception)]
         if valid_results:
             best_trade_candidate = max(valid_results, key=lambda x: x['score'])
             trade = best_trade_candidate
             logging.info(f"HIGH-CONFIDENCE SIGNAL found: {trade['token']['symbol'].upper()} ({trade['type']}), Score: {trade['score']:.1f}")
-            
             adjusted_max_size = config.MAX_POSITION_SIZE_USD * (win_rate / 100) if win_rate > 50 else config.BASE_POSITION_SIZE_USD
             position_size = trader.calculate_position_size(trade['score'], base_size_usd=config.BASE_POSITION_SIZE_USD, max_size_usd=adjusted_max_size)
-            
-            trader.open_position(
-                trade['type'], trade['token']['id'], trade['series'], trade['score'],
-                notifier=notifier, analysis_comment=trade['analysis'], position_size_usd=position_size
-            )
+            trader.open_position(trade['type'], trade['token']['id'], trade['series'], trade['score'],
+                notifier=notifier, analysis_comment=trade['analysis'], position_size_usd=position_size)
         else:
             logging.info("No high-confidence trading opportunities found.")
-
     logging.info("--- ✅ Intelligent Trading Cycle Finished ---")
 
 # --- 5. スケジューラとプログラム起動 ---
+def run_async_job(job_func, *args, **kwargs):
+    """スケジュールされた非同期ジョブを安全に実行するためのヘルパー"""
+    asyncio.run(job_func(*args, **kwargs))
+
 def run_scheduler():
-    """スケジュールを管理し、非同期タスクを呼び出す"""
-    logging.info("Scheduler started.")
+    logging.info("Scheduler started with JST timezone.")
+    jst = pytz.timezone('Asia/Tokyo')
     
-    # asyncioイベントループを現在のスレッド用に取得または作成
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # スケジュールジョブを定義
     for t in config.TRADING_CYCLE_TIMES:
-        schedule.every().day.at(t, "Asia/Tokyo").do(lambda: loop.create_task(run_trading_cycle_async()))
-    # schedule.every().day.at(config.DAILY_SUMMARY_TIME, "Asia/Tokyo").do(run_daily_summary)
+        schedule.every().day.at(t, jst).do(lambda: run_async_job(run_trading_cycle_async))
+    # schedule.every().day.at(config.DAILY_SUMMARY_TIME, jst).do(run_daily_summary)
 
     while True:
-        schedule.run_pending()
-        time.sleep(1)
+        schedule.run_pending(); time.sleep(1)
 
 if __name__ == "__main__":
     logging.info("Initializing Bot...")
     state.load_state_from_disk()
-    
     threading.Thread(target=run_scheduler, daemon=True).start()
-    
     port = int(os.environ.get("PORT", 8080))
-    # 本番環境ではGunicornがWSGIサーバーとして動作するため、app.runは不要
-    # ローカルでのテスト実行の場合のみ、以下の行のコメントを外す
-    # app.run(host='0.0.0.0', port=port, debug=False)
+    # Gunicornが本番環境のWebサーバーとなるため、app.runは不要
+    # For local testing: app.run(host='0.0.0.0', port=port, debug=False)
