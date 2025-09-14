@@ -11,7 +11,6 @@ from analysis_engine import AnalysisEngine
 from state_manager import StateManager
 from trading_executor import TradingExecutor
 from data_aggregator import DataAggregator
-# from model_loader import load_model   # もし独自のモデル読み込み関数があるならこちらを使う
 
 # ---------------------------------------------------
 # 環境変数ロード & ロガー設定
@@ -32,10 +31,10 @@ app = Flask(__name__)
 state_manager = StateManager()
 data_aggregator = DataAggregator()
 analyzer = AnalysisEngine()
-executor = TradingExecutor(exchange_name="bitget", market_type="swap")
+executor = TradingExecutor(state_manager)   # ✅ 修正
 
 # ---------------------------------------------------
-# モデル読み込み（仮実装: 本来は load_model() 等を使う）
+# モデル読み込み（仮実装: 後で差し替え可）
 # ---------------------------------------------------
 def load_model():
     logging.info("Dummy model loaded (replace with actual model).")
@@ -62,7 +61,7 @@ async def run_trading_cycle_async():
         logging.error("Market dataframe is empty. Skipping cycle.")
         return
 
-    # ✅ 修正: model を渡す
+    # ✅ model を渡して実行
     long_df, short_df, spike_df, summary = analyzer.run_analysis(safe_data, model)
 
     logging.info("All technical indicators calculated.")
@@ -71,13 +70,13 @@ async def run_trading_cycle_async():
     if not long_df.empty:
         for _, row in long_df.iterrows():
             logging.info(f"📈 LONG Signal detected: {row['symbol']}")
-            executor.execute_trade(row['symbol'], "long")
+            executor.open_position("LONG", row['symbol'], safe_data, score=80)
 
     # ショートシグナル処理
     if not short_df.empty:
         for _, row in short_df.iterrows():
             logging.info(f"📉 SHORT Signal detected: {row['symbol']}")
-            executor.execute_trade(row['symbol'], "short")
+            executor.open_position("SHORT", row['symbol'], safe_data, score=80)
 
     # スパイク検出処理
     if not spike_df.empty:
@@ -125,4 +124,3 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
