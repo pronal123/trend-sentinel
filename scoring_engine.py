@@ -4,24 +4,14 @@ import pandas as pd
 import pandas_ta as ta
 
 class ScoringEngine:
-    """
-    市場の多角的分析とスコアリングを担当する。
-    市場レジームに応じて分析ウェイトを動的に変更し、分析コメントを生成する。
-    """
     def __init__(self, exchange):
         self.exchange = exchange
-        # レジーム別のウェイトを定義
         self.WEIGHTS_TRENDING = {'technical': 25, 'trend': 35, 'sentiment': 15, 'order_book': 25}
         self.WEIGHTS_RANGING = {'technical': 35, 'trend': 5, 'sentiment': 25, 'order_book': 35}
 
     def calculate_total_score(self, token_data, series, fng_data, regime):
-        """
-        渡されたデータを基に全項目を評価し、総合得点、時系列データ、分析コメントを返す。
-        """
-        # --- ▼▼▼ 修正箇所 ▼▼▼ ---
-        # seriesが不正な場合、期待される3つの値を返し、エラーを防ぐ
         if series is None or series.empty or 'close' not in series.columns:
-            return 0, series, "分析対象の市場データが不完全か、取得に失敗しました。"
+            return 0, "分析対象の市場データが不完全です。"
 
         weights = self.WEIGHTS_TRENDING if regime == 'TRENDING' else self.WEIGHTS_RANGING
         
@@ -40,21 +30,30 @@ class ScoringEngine:
         )
         
         logging.info(f"Scoring for {token_data['symbol']}: TOTAL={total_score:.1f} (Regime: {regime})")
-        
-        # 正常終了時も、必ず3つの値を返す
-        return total_score, series, analysis_comments
-        # --- ▲▲▲ ここまで ▲▲▲ ---
+        return total_score, analysis_comments
 
     def _score_technical(self, series, max_score):
         try:
             if not all(k in series.columns for k in ['open', 'high', 'low', 'close']):
                 raise ValueError("OHLC data missing.")
-            rsi = series.ta.rsi().iloc[-1]
-            macd = series.ta.macd().iloc[-1]
+            
+            # --- ▼▼▼ 修正箇所 ▼▼▼ ---
+            # テクニカル指標を追加
+            series.ta.rsi(append=True)
+            series.ta.macd(append=True)
+            
+            # 指標計算後、全ての列名を小文字に統一する
+            series.columns = [col.lower() for col in series.columns]
+            # --- ▲▲▲ ここまで ▲▲▲ ---
+
+            rsi = series['rsi_14'].iloc[-1]
+            macd_hist = series['macdh_12_26_9'].iloc[-1]
+            
             score = 0
             if 30 < rsi < 65: score += max_score * 0.5
-            if macd['macdh_12_26_9'] > 0: score += max_score * 0.5
-            comment = f"RSI({rsi:.1f})は中立圏、MACDは上昇の勢いを示唆。"
+            if macd_hist > 0: score += max_score * 0.5 # ヒストグラムが0より上なら上昇の勢いあり
+            
+            comment = f"RSI({rsi:.1f})は中立圏、MACDヒストグラムは正の値。"
             return score, f"📈 テクニカル ({score:.1f}/{max_score}点)\n{comment}"
         except Exception as e:
             return 0, f"📈 テクニカル (0/{max_score}点)\n計算エラー: {e}"
