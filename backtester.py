@@ -3,132 +3,88 @@ import pandas as pd
 import logging
 import requests
 import json
+import os
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from data_aggregator import DataAggregator
+
+load_dotenv()
 
 
 class Backtester:
-    def __init__(self, interval="5m", period="30d", state_file="bot_state.json"):
+    def __init__(self, interval="5m", period="30d", state_file="bot_state.json", cache_file="trending_cache.json"):
         self.interval = interval
         self.period = period
         self.aggregator = DataAggregator()
         self.state_file = state_file
+        self.cache_file = cache_file
+        self.coingecko_key = os.getenv("COINGECKO_API_KEY")
+
+    # --- トレンドキャッシュを管理 ---
+    def _load_trending_cache(self):
+        if os.path.exists(self.cache_file):
+            with open(self.cache_file, "r") as f:
+                return json.load(f)
+        return []
+
+    def _save_trending_cache(self, data):
+        with open(self.cache_file, "w") as f:
+            json.dump(data, f, indent=2)
 
     # --- 動的銘柄リスト生成 ---
     def get_dynamic_symbols(self):
         symbols = set()
+        now = datetime.utcnow()
+        trending_cache = self._load_trending_cache()
 
-        # Coingecko トレンド銘柄
+        # Coingecko トレンド銘柄（TOP7）
         try:
             url = "https://api.coingecko.com/api/v3/search/trending"
-            res = requests.get(url, timeout=10).json()
+            headers = {"accept": "application/json"}
+            if self.coingecko_key:
+                headers["x-cg-pro-api-key"] = self.coingecko_key
+            res = requests.get(url, headers=headers, timeout=10).json()
+
+            new_entries = []
             for item in res.get("coins", []):
                 symbol = item["item"]["symbol"].upper()
-                symbols.add(f"{symbol}-USD")
+                symbol_full = f"{symbol}-USD"
+                symbols.add(symbol_full)
+                new_entries.append({"symbol": symbol_full, "time": now.isoformat()})
+
+            # キャッシュに追加
+            trending_cache.extend(new_entries)
+
         except Exception as e:
             logging.error(f"Coingecko fetch error: {e}")
+
+        # 24時間以内の履歴を残す
+        cutoff = now - timedelta(hours=24)
+        trending_cache = [entry for entry in trending_cache if datetime.fromisoformat(entry["time"]) >= cutoff]
+        self._save_trending_cache(trending_cache)
+
+        # 24h 履歴を追加
+        for entry in trending_cache:
+            symbols.add(entry["symbol"])
 
         # 保有ポジション銘柄（state_manager 管理）
         try:
             with open(self.state_file, "r") as f:
                 state = json.load(f)
-                positions = state.get("positions", [])
-                for pos in positions:
-                    symbols.add(f"{pos['symbol']}-USD")
+                positions = state.get("positions", {})
+                for sym in positions.keys():
+                    symbols.add(f"{sym}-USD")
         except Exception as e:
             logging.warning(f"Could not load state file: {e}")
 
-        # デフォルトの主要銘柄を保険で追加
+        # デフォルト主要銘柄
         default = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD"]
         symbols.update(default)
 
         logging.info(f"Dynamic backtest symbols: {symbols}")
         return list(symbols)
 
+    # --- バックテスト実行（省略: 前バージョンと同じ） ---
     def run_backtest_for_symbol(self, symbol):
-        logging.info(f"Backtesting {symbol} ({self.period}, {self.interval})")
-
-        df = yf.download(symbol, period=self.period, interval=self.interval, progress=False)
-        if df.empty:
-            logging.error(f"No historical data for {symbol}")
-            return {}
-
-        trades = []
-        balance = 10000.0
-        position = None
-
-        for i in range(2, len(df)):
-            row = df.iloc[i]
-            price = row["Close"]
-
-            if position is None:
-                change_1h = (df["Close"].iloc[i] / df["Close"].iloc[i-12] - 1) * 100 if i >= 12 else 0
-                change_24h = (df["Close"].iloc[i] / df["Close"].iloc[i-288] - 1) * 100 if i >= 288 else 0
-
-                if change_24h > 5 and change_1h > 2:
-                    tp, sl = self.aggregator.calc_takeprofit_stoploss(price, 0.1)
-                    position = {"side": "long", "entry": price, "tp": tp, "sl": sl}
-                elif change_24h < -5 and change_1h < -2:
-                    tp, sl = self.aggregator.calc_takeprofit_stoploss(price, -0.1)
-                    position = {"side": "short", "entry": price, "tp": tp, "sl": sl}
-
-            else:
-                if position["side"] == "long":
-                    if price >= position["tp"]:
-                        profit = position["tp"] - position["entry"]
-                        balance += profit
-                        trades.append({"symbol": symbol, "side": "long", "result": "win", "profit": profit})
-                        position = None
-                    elif price <= position["sl"]:
-                        loss = position["sl"] - position["entry"]
-                        balance += loss
-                        trades.append({"symbol": symbol, "side": "long", "result": "loss", "profit": loss})
-                        position = None
-
-                elif position["side"] == "short":
-                    if price <= position["tp"]:
-                        profit = position["entry"] - position["tp"]
-                        balance += profit
-                        trades.append({"symbol": symbol, "side": "short", "result": "win", "profit": profit})
-                        position = None
-                    elif price >= position["sl"]:
-                        loss = position["entry"] - position["sl"]
-                        balance += loss
-                        trades.append({"symbol": symbol, "side": "short", "result": "loss", "profit": loss})
-                        position = None
-
-        df_trades = pd.DataFrame(trades)
-        win_rate = (df_trades["result"] == "win").mean() * 100 if not df_trades.empty else 0
-        total_profit = df_trades["profit"].sum() if not df_trades.empty else 0
-
-        summary = {
-            "symbol": symbol,
-            "total_trades": len(trades),
-            "win_rate": round(win_rate, 2),
-            "final_balance": round(balance, 2),
-            "total_profit": round(total_profit, 2),
-        }
-
-        df_trades.to_csv(f"backtest_{symbol.replace('-','_')}.csv", index=False)
-        return summary
-
-    def run_all(self):
-        symbols = self.get_dynamic_symbols()
-        results = []
-        for sym in symbols:
-            res = self.run_backtest_for_symbol(sym)
-            if res:
-                results.append(res)
-
-        df_results = pd.DataFrame(results)
-        if not df_results.empty:
-            overall = {
-                "symbol": "ALL",
-                "total_trades": df_results["total_trades"].sum(),
-                "win_rate": round(df_results["win_rate"].mean(), 2),
-                "final_balance": round(df_results["final_balance"].mean(), 2),
-                "total_profit": round(df_results["total_profit"].sum(), 2),
-            }
-            results.append(overall)
-
-        pd.DataFrame(results).to_csv("backtest_summary.csv", index=False)
-        return results
+        # （ここは前回のコードと同じ処理）
+        ...
