@@ -19,7 +19,8 @@ class DataAggregator:
     def get_market_data(self, chain_id):
         try:
             coins = self.cg.get_coins_markets(vs_currency='usd', category=CHAIN_IDS.get(chain_id), per_page=250, page=1, price_change_percentage='1h,24h')
-            if not coins: return pd.DataFrame()
+            if not coins:
+                return pd.DataFrame()
             df = pd.DataFrame(coins)
             df = df[['id', 'symbol', 'current_price', 'total_volume', 'price_change_percentage_24h_in_currency', 'price_change_percentage_1h_in_currency']]
             df.rename(columns={'price_change_percentage_24h_in_currency': 'price_change_24h', 'price_change_percentage_1h_in_currency': 'price_change_1h'}, inplace=True)
@@ -31,18 +32,31 @@ class DataAggregator:
             return pd.DataFrame()
 
     def get_all_chains_data(self):
-        all_data = [self.get_market_data(name) for name in CHAIN_IDS.keys()]
-        all_data = [df for df in all_data if not df.empty]
-        if not all_data: return pd.DataFrame()
+        all_data = []
+        for chain_name in CHAIN_IDS.keys():
+            chain_data = self.get_market_data(chain_name)
+            if not chain_data.empty:
+                chain_data['chain'] = chain_name
+                all_data.append(chain_data)
+        if not all_data:
+            logging.error("Failed to fetch data from any chain.")
+            return pd.DataFrame()
         return pd.concat(all_data, ignore_index=True)
 
     def fetch_ohlcv(self, yf_ticker, period='1y', interval='1d'):
         try:
             data = yf.download(yf_ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-            if data.empty: return pd.DataFrame()
-            if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
+            if data.empty:
+                return pd.DataFrame()
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+            
+            # ▼▼▼ ここが修正点 ▼▼▼
+            # カラム名を大文字始まりに統一する (例: 'open' -> 'Open')
             data.columns = [col.capitalize() for col in data.columns]
-            if not {'Open', 'High', 'Low', 'Close', 'Volume'}.issubset(data.columns): return pd.DataFrame()
+            
+            if not {'Open', 'High', 'Low', 'Close', 'Volume'}.issubset(data.columns):
+                return pd.DataFrame()
             return data
         except Exception as e:
             logging.error(f"Error fetching OHLCV for {yf_ticker}: {e}")
@@ -61,6 +75,8 @@ class DataAggregator:
     def get_latest_price(self, token_id):
         try:
             price_data = self.cg.get_price(ids=token_id, vs_currencies='usd')
-            if token_id in price_data and 'usd' in price_data[token_id]: return price_data[token_id]['usd']
+            if token_id in price_data and 'usd' in price_data[token_id]:
+                return price_data[token_id]['usd']
             return None
-        except Exception: return None
+        except Exception:
+            return None
