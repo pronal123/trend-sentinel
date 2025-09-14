@@ -3,15 +3,14 @@ import asyncio
 import logging
 import schedule
 import time
+import numpy as np
+import datetime
+import random
 from threading import Thread
 from flask import Flask, jsonify, render_template_string, request
 
 from state_manager import StateManager
-from data_aggregator import DataAggregator
-
-import numpy as np
-import datetime
-import random
+from data_aggregator import DataAggregator  # 市場データ取得用
 
 # ---------------------------------------
 # ログ設定
@@ -29,12 +28,12 @@ app = Flask(__name__)
 state_manager = StateManager()
 data_aggregator = DataAggregator()
 
-# 認証（/status用）
+# 認証キー
 API_KEY = os.getenv("STATUS_API_KEY", "changeme")
 
 
 # ---------------------------------------
-# バックテスト（履歴付き）
+# バックテスト結果（ダミー）
 # ---------------------------------------
 def run_backtest():
     np.random.seed(42)
@@ -67,12 +66,12 @@ def run_backtest():
     dd = (np.array(balance) - peak) / peak
     max_dd = dd.min() * 100
 
-    # JST日次リターン集計（365日分）
+    # JST日次リターン集計
     daily_returns = {}
     base_date = datetime.date.today() - datetime.timedelta(days=365)
     for i in range(365):
         date = base_date + datetime.timedelta(days=i)
-        pnl = float(np.random.normal(0, 50))  # ダミー損益
+        pnl = float(np.random.normal(0, 50))
         ret_pct = pnl / 10000
         daily_returns[str(date)] = {
             "pnl_usdt": pnl,
@@ -87,7 +86,7 @@ def run_backtest():
         "balance_curve": balance,
         "drawdown_curve": dd.tolist(),
         "daily_returns": daily_returns,
-        "trade_history": trades[-1000:],  # 直近1000件
+        "trade_history": trades[-1000:],
     }
 
 
@@ -95,7 +94,7 @@ backtest_result = run_backtest()
 
 
 # ---------------------------------------
-# トレードサイクル
+# トレードサイクル（ダミー更新）
 # ---------------------------------------
 async def run_trading_cycle():
     logging.info("=== Trading Cycle Start ===")
@@ -107,7 +106,8 @@ async def run_trading_cycle():
         if state_manager.state["balance_history"]
         else 10000
     )
-    state_manager.record_trade_result("BTC", "win", pnl=5.0, balance=last_balance + 5.0)
+    # ダミートレード記録
+    state_manager.record_trade_result("BTC", "LONG", pnl=5.0, balance=last_balance + 5.0)
 
     logging.info("Cycle finished. State updated.")
 
@@ -135,10 +135,7 @@ def status():
 
 @app.route("/status_page")
 def status_page():
-    return render_template_string(
-        DASHBOARD_HTML,
-        api_key=API_KEY,
-    )
+    return render_template_string(DASHBOARD_HTML, api_key=API_KEY)
 
 
 # ---------------------------------------
@@ -164,18 +161,17 @@ DASHBOARD_HTML = """
   <h1>🚀 Trading Bot Dashboard</h1>
 
   <h2>リアルタイム統計</h2>
+  <div class="panel" id="liveStats"></div>
   <div class="panel"><canvas id="winrateGauge"></canvas></div>
   <div class="panel"><h3>資産曲線</h3><canvas id="balanceChart"></canvas></div>
   <div class="panel"><h3>ドローダウン</h3><canvas id="ddChart"></canvas></div>
-  <div class="panel"><h3>日次リターン Heatmap</h3><div id="heatmap" class="heatmap"></div></div>
 
   <h2>📊 バックテスト結果</h2>
-  <div id="backtestStats"></div>
+  <div class="panel" id="backtestStats"></div>
   <div class="panel"><h3>資産曲線（Backtest）</h3><canvas id="btBalance"></canvas></div>
   <div class="panel"><h3>DD曲線（Backtest）</h3><canvas id="btDD"></canvas></div>
-  <div class="panel"><h3>日次リターン Heatmap（Backtest, 365日）</h3><div id="btHeatmap" class="heatmap"></div></div>
 
-  <h2>📜 バックテスト取引履歴（直近1000件）</h2>
+  <h2>📜 トレード履歴（直近1000件）</h2>
   <table id="tradeTable">
     <thead>
       <tr><th>ID</th><th>Symbol</th><th>Side</th><th>PnL (USDT)</th><th>Return %</th><th>Balance</th><th>Date</th></tr>
@@ -221,31 +217,12 @@ function renderDD(history, ctxId){
   });
 }
 
-function renderHeatmap(daily, divId){
-  const container = document.getElementById(divId);
-  container.innerHTML="";
-  const dates = Object.keys(daily).sort();
-  dates.forEach(d=>{
-    const val = daily[d].pnl_usdt;
-    let color="#eee";
-    if(val>50) color="#2e7d32";
-    else if(val>0) color="#81c784";
-    else if(val>-50) color="#ef9a9a";
-    else color="#c62828";
-    const cell=document.createElement("div");
-    cell.className="cell";
-    cell.style.background=color;
-    cell.title=`${d}\\nPnL:${val.toFixed(2)} USDT`;
-    container.appendChild(cell);
-  });
-}
-
 function renderTradeTable(trades){
   const tbody = document.querySelector("#tradeTable tbody");
   tbody.innerHTML="";
-  trades.slice(-1000).reverse().forEach(t=>{
+  trades.slice(-1000).reverse().forEach((t,i)=>{
     const row = document.createElement("tr");
-    row.innerHTML = `<td>${t.id}</td><td>${t.symbol}</td><td>${t.side}</td>
+    row.innerHTML = `<td>${i+1}</td><td>${t.symbol}</td><td>${t.side}</td>
       <td>${t.pnl.toFixed(2)}</td><td>${t.return_pct.toFixed(2)}%</td>
       <td>${t.balance.toFixed(2)}</td><td>${t.timestamp}</td>`;
     tbody.appendChild(row);
@@ -254,11 +231,17 @@ function renderTradeTable(trades){
 
 async function update(){
   const data = await fetchStatus();
-  renderWinRate(data.win_rate);
+  renderWinRate(data.win_rate || 50);
   renderBalance(data.balance_history,"balanceChart","Balance");
   renderDD(data.balance_history,"ddChart");
-  renderHeatmap(data.daily_returns,"heatmap");
 
+  // リアルタイム統計
+  document.getElementById("liveStats").innerHTML =
+    `<b>直近1000トレード統計:</b><br>
+     勝率: ${(data.win_rate||0).toFixed(2)}%<br>
+     残高: ${(data.balance||0).toFixed(2)} USDT`;
+
+  // バックテスト統計
   const bt = data.backtest;
   document.getElementById("backtestStats").innerHTML =
     `<b>勝率:</b> ${bt.win_rate.toFixed(2)}% | 
@@ -271,8 +254,7 @@ async function update(){
     data:{labels: bt.drawdown_curve.map((_,i)=>i),
     datasets:[{label:"Backtest DD%", data: bt.drawdown_curve.map(x=>x*100), borderColor:"#ff9800", fill:false}]}
   });
-  renderHeatmap(bt.daily_returns,"btHeatmap");
-  renderTradeTable(bt.trade_history);
+  renderTradeTable(data.trade_history || []);
 }
 update();
 setInterval(update,60000);
