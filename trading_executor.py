@@ -1,102 +1,103 @@
 import os
+import time
 import hmac
 import hashlib
-import time
 import requests
 import logging
+from state_manager import StateManager
 
 class TradingExecutor:
-    BASE_URL = "https://api.bitget.com"
+    def __init__(self, api_key, api_secret, passphrase, symbol="BTCUSDT_UMCBL"):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.passphrase = passphrase
+        self.symbol = symbol
+        self.base_url = "https://api.bitget.com"
+        self.state_manager = StateManager()
 
-    def __init__(self):
-        self.api_key = os.getenv("BITGET_API_KEY")
-        self.secret = os.getenv("BITGET_API_SECRET")
-        self.passphrase = os.getenv("BITGET_API_PASSPHRASE")
-        self.account_type = os.getenv("BITGET_ACCOUNT_TYPE", "spot")  # spot or futures
+        # Telegram設定
+        self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        self.tg_chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-        if not all([self.api_key, self.secret, self.passphrase]):
-            raise ValueError("Bitget API認証情報が不足しています (.env を確認してください)")
+    def _sign(self, method, path, body=""):
+        timestamp = str(int(time.time() * 1000))
+        prehash = timestamp + method + path + body
+        sign = hmac.new(
+            self.api_secret.encode("utf-8"),
+            prehash.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        return timestamp, sign
 
-    def _sign(self, method: str, endpoint: str, params: str = ""):
-        ts = str(int(time.time() * 1000))
-        prehash = ts + method + endpoint + params
-        sign = hmac.new(self.secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).hexdigest()
-        return ts, sign
-
-    def _headers(self, method: str, endpoint: str, params: str = ""):
-        ts, sign = self._sign(method, endpoint, params)
+    def _headers(self, method, path, body=""):
+        timestamp, sign = self._sign(method, path, body)
         return {
             "ACCESS-KEY": self.api_key,
             "ACCESS-SIGN": sign,
-            "ACCESS-TIMESTAMP": ts,
+            "ACCESS-TIMESTAMP": timestamp,
             "ACCESS-PASSPHRASE": self.passphrase,
             "Content-Type": "application/json"
         }
 
-    def place_order(self, symbol: str, side: str, size: float, price: float = None, leverage: int = 1):
-        """
-        side: buy/sell
-        size: 注文数量
-        price: Noneなら成行
-        leverage: 先物の場合のレバレッジ
-        """
-        if self.account_type == "spot":
-            endpoint = "/api/spot/v1/trade/orders"
-            url = self.BASE_URL + endpoint
-            data = {
-                "symbol": symbol,
-                "side": side,
-                "orderType": "limit" if price else "market",
-                "force": "gtc",
-                "price": str(price) if price else "",
-                "quantity": str(size)
-            }
-        else:  # futures
-            endpoint = "/api/mix/v1/order/placeOrder"
-            url = self.BASE_URL + endpoint
-            data = {
-                "symbol": symbol,
+    def open_position(self, side, size, entry_price, tp, sl):
+        try:
+            url = f"{self.base_url}/api/mix/v1/order/placeOrder"
+            body = {
+                "symbol": self.symbol,
                 "marginCoin": "USDT",
-                "side": "open_long" if side == "buy" else "open_short",
-                "orderType": "limit" if price else "market",
-                "price": str(price) if price else "",
                 "size": str(size),
-                "leverage": str(leverage),
-                "timeInForceValue": "normal"
+                "side": "open_long" if side == "long" else "open_short",
+                "orderType": "market",
+                "timeInForceValue": "normal",
+                "reduceOnly": False
             }
+            res = requests.post(url, headers=self._headers("POST", "/api/mix/v1/order/placeOrder", ""), json=body)
+            res_json = res.json()
 
-        headers = self._headers("POST", endpoint, "")
-        try:
-            r = requests.post(url, headers=headers, json=data, timeout=10)
-            res = r.json()
-            logging.info(f"Order response: {res}")
-            return res
+            if res.status_code == 200 and res_json.get("msg") == "success":
+                logging.info(f"新規建玉成功 {side} {size} {self.symbol}")
+                self.state_manager.add_position(self.symbol, side, entry_price, size, tp, sl)
+                self._notify_telegram(f"✅ 新規建玉: {self.symbol} {side}\n数量: {size}\n価格: {entry_price}\nTP: {tp}, SL: {sl}")
+            else:
+                logging.error(f"建玉失敗 {res_json}")
         except Exception as e:
-            logging.error(f"注文エラー: {e}")
-            return None
+            logging.error(f"open_position エラー: {e}")
 
-    def close_position(self, symbol: str, side: str, size: float):
-        """ 先物ポジションのクローズ """
-        if self.account_type != "futures":
-            logging.warning("close_position は futures アカウントのみ対応")
-            return None
-
-        endpoint = "/api/mix/v1/order/placeOrder"
-        url = self.BASE_URL + endpoint
-        data = {
-            "symbol": symbol,
-            "marginCoin": "USDT",
-            "side": "close_long" if side == "buy" else "close_short",
-            "orderType": "market",
-            "size": str(size),
-            "timeInForceValue": "normal"
-        }
-        headers = self._headers("POST", endpoint, "")
+    def close_position(self, position, exit_price, reason="manual"):
         try:
-            r = requests.post(url, headers=headers, json=data, timeout=10)
-            res = r.json()
-            logging.info(f"Close response: {res}")
-            return res
+            url = f"{self.base_url}/api/mix/v1/order/placeOrder"
+            body = {
+                "symbol": position["symbol"],
+                "marginCoin": "USDT",
+                "size": str(position["size"]),
+                "side": "close_long" if position["side"] == "long" else "close_short",
+                "orderType": "market",
+                "timeInForceValue": "normal",
+                "reduceOnly": True
+            }
+            res = requests.post(url, headers=self._headers("POST", "/api/mix/v1/order/placeOrder", ""), json=body)
+            res_json = res.json()
+
+            if res.status_code == 200 and res_json.get("msg") == "success":
+                logging.info(f"ポジション決済成功 {position['side']} {position['symbol']} @ {exit_price}")
+                self.state_manager.close_position(position["symbol"], exit_price, reason)
+                pnl = (exit_price - position["entry_price"]) * position["size"] if position["side"] == "long" else (position["entry_price"] - exit_price) * position["size"]
+                self._notify_telegram(
+                    f"💰 決済完了: {position['symbol']} {position['side']}\n"
+                    f"数量: {position['size']}\nExit価格: {exit_price}\n"
+                    f"理由: {reason.upper()}\n損益: {pnl:.2f} USDT"
+                )
+            else:
+                logging.error(f"決済失敗 {res_json}")
         except Exception as e:
-            logging.error(f"クローズ注文エラー: {e}")
-            return None
+            logging.error(f"close_position エラー: {e}")
+
+    def _notify_telegram(self, message: str):
+        if not self.tg_token or not self.tg_chat_id:
+            return
+        try:
+            url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
+            payload = {"chat_id": self.tg_chat_id, "text": message}
+            requests.post(url, json=payload, timeout=10)
+        except Exception as e:
+            logging.error(f"Telegram通知失敗: {e}")
