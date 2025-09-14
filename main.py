@@ -1,187 +1,217 @@
 import os
+import asyncio
 import logging
-import time
-import threading
-import pytz
 import schedule
+import time
+from dotenv import load_dotenv
+from flask import Flask, request, abort
+from threading import Thread
 from datetime import datetime
-from flask import Flask, jsonify, render_template_string, request, Response
-from functools import wraps
+import pytz
+import requests
 
-from data_aggregator import build_market_snapshot
+from analysis_engine import AnalysisEngine
 from state_manager import StateManager
+from trading_executor import TradingExecutor
+from data_aggregator import DataAggregator
 
-logging.basicConfig(level=logging.INFO)
+# ---------------------------------------------------
+# 環境変数ロード & ロガー設定
+# ---------------------------------------------------
+load_dotenv()
 
-# Flask
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+# Flask アプリ
 app = Flask(__name__)
-state = StateManager("bot_state.json")
 
 # ---------------------------------------------------
-# BASIC 認証
+# 初期化
 # ---------------------------------------------------
-USER = os.getenv("DASHBOARD_USER", "admin")
-PASS = os.getenv("DASHBOARD_PASS", "password")
+state_manager = StateManager()
+data_aggregator = DataAggregator()
+analyzer = AnalysisEngine()
+executor = TradingExecutor(state_manager)
 
-def check_auth(username, password):
-    return username == USER and password == PASS
+# Telegram
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def authenticate():
-    return Response(
-        "Authentication required", 401,
-        {"WWW-Authenticate": "Basic realm='Login Required'"}
-    )
-
-def requires_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth = request.authorization
-        if not auth or not check_auth(auth.username, auth.password):
-            return authenticate()
-        return f(*args, **kwargs)
-    return decorated
+# 認証キー（内部監視用）
+STATUS_AUTH_KEY = os.getenv("STATUS_AUTH_KEY", "changeme")
 
 # ---------------------------------------------------
-# 定期タスク：6時間ごとに分析
+# ダミーモデル
 # ---------------------------------------------------
-def monitor_cycle():
-    snapshot = build_market_snapshot(state)
-    state.save_snapshot(snapshot)
-    logging.info("✅ Snapshot updated (scheduled).")
+def load_model():
+    logging.info("Dummy model loaded (replace with actual model).")
+    return "dummy_model"
 
-schedule.every().day.at("02:00").do(monitor_cycle)
-schedule.every().day.at("08:00").do(monitor_cycle)
-schedule.every().day.at("14:00").do(monitor_cycle)
-schedule.every().day.at("20:00").do(monitor_cycle)
+model = load_model()
 
+# ---------------------------------------------------
+# Telegram 通知関数
+# ---------------------------------------------------
+def send_telegram_message(html_text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("Telegram credentials missing, skipping send.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": html_text,
+        "parse_mode": "HTML"
+    }
+    try:
+        res = requests.post(url, data=payload, timeout=10)
+        if res.status_code != 200:
+            logging.error(f"Telegram send error: {res.text}")
+    except Exception as e:
+        logging.error(f"Telegram send failed: {e}")
+
+def jst_now_str():
+    return datetime.now(pytz.timezone("Asia/Tokyo")).strftime("%Y/%m/%d %H:%M")
+
+# ---------------------------------------------------
+# レポート作成
+# ---------------------------------------------------
+def build_regular_report(long_df, short_df, spike_df, summary):
+    balance = executor.get_account_balance_usd()
+    win_rate = state_manager.get_win_rate()
+    market_snapshot = data_aggregator.build_market_snapshot()
+
+    msg = f"<b>📡 トレンドセンチネル定期レポート（{jst_now_str()} JST）</b>\n\n"
+    msg += f"<b>💰 残高</b> : {balance:.2f} USDT\n"
+    msg += f"<b>📊 勝率</b> : {win_rate:.1f}%\n"
+    msg += f"<b>📈 市場状況</b> : {market_snapshot.get('fear_greed','N/A')}\n\n"
+
+    # LONG 候補
+    msg += "<b>🔹 LONG 候補</b>\n"
+    if not long_df.empty:
+        for _, row in long_df.iterrows():
+            msg += f"• <b>{row['symbol']}</b> (+{row['price_change_24h']:.1f}% / 出来高 {row['volume_change_24h']:.0f}%)\n"
+            msg += f"  └ 利確: {row.get('take_profit','-')} / 損切: {row.get('stop_loss','-')}\n"
+            msg += f"  └ AIコメント: 「買い優勢、モメンタム強」\n"
+    else:
+        msg += "（該当なし）\n"
+
+    # SHORT 候補
+    msg += "\n<b>🔻 SHORT 候補</b>\n"
+    if not short_df.empty:
+        for _, row in short_df.iterrows():
+            msg += f"• <b>{row['symbol']}</b> ({row['price_change_24h']:.1f}% / 出来高 {row['volume_change_24h']:.0f}%)\n"
+            msg += f"  └ 利確: {row.get('take_profit','-')} / 損切: {row.get('stop_loss','-')}\n"
+            msg += f"  └ AIコメント: 「売り圧力優勢」\n"
+    else:
+        msg += "（該当なし）\n"
+
+    # Spike 候補
+    msg += "\n<b>⚡ 急騰アラート</b>\n"
+    if not spike_df.empty:
+        for _, row in spike_df.iterrows():
+            msg += f"• <b>{row['symbol']}</b> (+{row['price_change_1h']:.1f}% / 15分出来高急増)\n"
+    else:
+        msg += "（該当なし）\n"
+
+    return msg
+
+def build_signal_alert(row, signal_type):
+    msg = f"<b>🚨 シグナル検出（{jst_now_str()} JST）</b>\n\n"
+    msg += f"<b>{signal_type}</b> シグナル: <b>{row['symbol']}</b>\n"
+    msg += f"24h変動: {row['price_change_24h']:.1f}% / 出来高 {row['volume_change_24h']:.0f}%\n"
+    msg += f"利確: {row.get('take_profit','-')} / 損切: {row.get('stop_loss','-')}\n"
+    msg += f"AIコメント: 「相場動向に注目」\n"
+    return msg
+
+# ---------------------------------------------------
+# 非同期トレーディングサイクル
+# ---------------------------------------------------
+async def run_trading_cycle_async():
+    logging.info("--- 🚀 Starting New Intelligent Trading Cycle ---")
+    win_rate = state_manager.get_win_rate()
+    logging.info(f"Current Bot Win Rate: {win_rate:.2f}%")
+
+    market_data = await data_aggregator.fetch_all()
+    if not market_data:
+        logging.error("No market data fetched. Skipping cycle.")
+        return
+
+    safe_data = data_aggregator.to_dataframe(market_data)
+    if safe_data.empty:
+        logging.error("Market dataframe is empty. Skipping cycle.")
+        return
+
+    long_df, short_df, spike_df, summary = analyzer.run_analysis(safe_data, model)
+
+    # シグナル検出時に即時通知
+    if not long_df.empty:
+        for _, row in long_df.iterrows():
+            send_telegram_message(build_signal_alert(row, "LONG"))
+            executor.open_position("LONG", row['symbol'], safe_data, score=80)
+
+    if not short_df.empty:
+        for _, row in short_df.iterrows():
+            send_telegram_message(build_signal_alert(row, "SHORT"))
+            executor.open_position("SHORT", row['symbol'], safe_data, score=80)
+
+    if not spike_df.empty:
+        for _, row in spike_df.iterrows():
+            send_telegram_message(build_signal_alert(row, "SPIKE"))
+
+    # 定期レポート送信
+    report_msg = build_regular_report(long_df, short_df, spike_df, summary)
+    send_telegram_message(report_msg)
+
+    # 状態保存
+    state_manager.save_state()
+
+# ---------------------------------------------------
+# スケジューラ設定
+# ---------------------------------------------------
 def run_scheduler():
+    schedule.every(5).minutes.do(lambda: asyncio.run(run_trading_cycle_async()))
     while True:
         schedule.run_pending()
-        time.sleep(30)
+        time.sleep(1)
 
 # ---------------------------------------------------
-# API: JSON形式（内部専用）
+# Flask エンドポイント
 # ---------------------------------------------------
 @app.route("/status")
-@requires_auth
 def status():
-    snapshot = build_market_snapshot(state)
-    return jsonify(snapshot)
+    auth = request.headers.get("Authorization")
+    if auth != f"Bearer {STATUS_AUTH_KEY}":
+        abort(401)
+    return {
+        "win_rate": state_manager.get_win_rate(),
+        "balance": executor.get_account_balance_usd(),
+        "positions": state_manager.get_all_active_positions(),
+        "market": data_aggregator.build_market_snapshot()
+    }
 
-# ---------------------------------------------------
-# Webフロント: 内部利用専用ダッシュボード
-# ---------------------------------------------------
 @app.route("/")
-@requires_auth
-def dashboard():
-    html = """ 
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <title>Trend Sentinel Dashboard</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <style>
-            body { font-family: Arial, sans-serif; background: #fff; color: #222; }
-            .container { max-width: 1200px; margin: auto; padding: 20px; }
-            h1 { text-align: center; }
-            .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-            .card { background: #f9f9f9; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-            canvas { width: 100% !important; height: 300px !important; }
-            pre { background: #eee; padding: 10px; border-radius: 5px; white-space: pre-wrap; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>📡 Trend Sentinel Dashboard</h1>
-            <div class="grid">
-                <div class="card">
-                    <h2>価格推移</h2>
-                    <canvas id="priceChart"></canvas>
-                </div>
-                <div class="card">
-                    <h2>勝率推移</h2>
-                    <canvas id="winRateChart"></canvas>
-                </div>
-            </div>
-            <div class="grid">
-                <div class="card">
-                    <h2>市場状況</h2>
-                    <div id="market"></div>
-                </div>
-                <div class="card">
-                    <h2>AIコメント</h2>
-                    <pre id="comments"></pre>
-                </div>
-            </div>
-        </div>
+def home():
+    return "🚀 Intelligent Trading Bot Dashboard (Auth Required for /status)"
 
-        <script>
-        const priceCtx = document.getElementById('priceChart').getContext('2d');
-        const winCtx = document.getElementById('winRateChart').getContext('2d');
-
-        let priceChart = new Chart(priceCtx, {
-            type: 'line',
-            data: { labels: [], datasets: [{ label: 'BTC Price', data: [], borderColor: 'blue' }] },
-            options: { responsive: true, animation: false }
-        });
-
-        let winChart = new Chart(winCtx, {
-            type: 'line',
-            data: { labels: [], datasets: [{ label: 'Win Rate (%)', data: [], borderColor: 'green' }] },
-            options: { responsive: true, animation: false }
-        });
-
-        async function fetchStatus() {
-            const res = await fetch('/status', { headers: { 'Authorization': 'Basic ' + btoa(prompt("Username:") + ":" + prompt("Password:")) }});
-            if (!res.ok) {
-                document.body.innerHTML = "<h2>認証エラー</h2>";
-                return;
-            }
-            const data = await res.json();
-
-            // BTC価格
-            const btc = data['BTC'] || {};
-            const price = btc.last_price || 0;
-            const now = new Date().toLocaleTimeString();
-
-            // price chart 更新
-            priceChart.data.labels.push(now);
-            priceChart.data.datasets[0].data.push(price);
-            if (priceChart.data.labels.length > 60) {
-                priceChart.data.labels.shift();
-                priceChart.data.datasets[0].data.shift();
-            }
-            priceChart.update();
-
-            // 勝率履歴
-            const history = data['meta']?.win_rate_history || [];
-            winChart.data.labels = history.map((h,i)=>i);
-            winChart.data.datasets[0].data = history;
-            winChart.update();
-
-            // 市場状況
-            document.getElementById("market").innerText = JSON.stringify(data['meta'], null, 2);
-
-            // コメント
-            let comments = "";
-            for (const [sym, obj] of Object.entries(data)) {
-                if (sym === "meta") continue;
-                comments += sym + "\\n" + (obj.comment || "") + "\\n\\n";
-            }
-            document.getElementById("comments").innerText = comments;
-        }
-
-        setInterval(fetchStatus, 1000);
-        fetchStatus();
-        </script>
-    </body>
-    </html>
-    """
-    return render_template_string(html)
-
+# ---------------------------------------------------
+# メインエントリーポイント
 # ---------------------------------------------------
 if __name__ == "__main__":
-    t = threading.Thread(target=run_scheduler, daemon=True)
-    t.start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    logging.info("Initializing Bot...")
+
+    scheduler_thread = Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+
+    logging.info("Scheduler thread started.")
+    logging.info("--- Starting BOT in ASYNC Direct Debug Mode ---")
+
+    try:
+        asyncio.run(run_trading_cycle_async())
+    except Exception as e:
+        logging.error(f"Error in initial run: {e}")
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
