@@ -34,25 +34,17 @@ class DataAggregator:
         all_data = []
         for chain_name in CHAIN_IDS.keys():
             chain_data = self.get_market_data(chain_name)
-            if not chain_data.empty:
-                chain_data['chain'] = chain_name
-                all_data.append(chain_data)
-        if not all_data:
-            logging.error("Failed to fetch data from any chain.")
-            return pd.DataFrame()
+            if not chain_data.empty: chain_data['chain'] = chain_name; all_data.append(chain_data)
+        if not all_data: return pd.DataFrame()
         return pd.concat(all_data, ignore_index=True)
 
     def fetch_ohlcv(self, yf_ticker, period='1y', interval='1d'):
         try:
             data = yf.download(yf_ticker, period=period, interval=interval, progress=False, auto_adjust=True)
             if data.empty: return pd.DataFrame()
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = data.columns.get_level_values(0)
-            
-            data.columns = [col.capitalize() for col in data.columns] # THIS IS THE FIX
-            
-            if not {'Open', 'High', 'Low', 'Close', 'Volume'}.issubset(data.columns):
-                return pd.DataFrame()
+            if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
+            data.columns = [col.capitalize() for col in data.columns]
+            if not {'Open', 'High', 'Low', 'Close', 'Volume'}.issubset(data.columns): return pd.DataFrame()
             return data
         except Exception as e:
             logging.error(f"Error fetching OHLCV for {yf_ticker}: {e}")
@@ -71,9 +63,6 @@ class DataAggregator:
     def get_latest_price(self, token_id):
         try:
             price_data = self.cg.get_price(ids=token_id, vs_currencies='usd')
-            if token_id in price_data and 'usd' in price_data[token_id]:
-                return price_data[token_id]['usd']
+            if token_id in price_data and 'usd' in price_data[token_id]: return price_data[token_id]['usd']
             return None
-        except Exception as e:
-            logging.error(f"Failed to fetch latest price for {token_id}: {e}")
-            return None
+        except Exception: return None
