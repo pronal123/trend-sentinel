@@ -5,6 +5,8 @@ import time
 import logging
 import asyncio
 import atexit
+import schedule
+import pytz
 from flask import Flask, render_template_string
 import pandas as pd
 import pandas_ta as ta
@@ -103,8 +105,7 @@ async def run_trading_cycle_async():
         logging.error("Could not fetch BTC data for market context. Aborting cycle.")
         return
     
-    # ATRを計算する命令を明確に追加
-    btc_series_daily.ta.atr(append=True)
+    btc_series_daily.ta.atr(append=True) # ATR計算の命令
     
     volatility = btc_series_daily['ATRp_14'].iloc[-1]
     time_frame = {'period': '7d', 'interval': '1h'} if volatility > 4.0 else {'period': '60d', 'interval': '4h'}
@@ -146,15 +147,26 @@ async def run_trading_cycle_async():
 
 # --- 5. スケジューラと非同期イベントループ ---
 def run_scheduler_sync():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    for t in config.TRADING_CYCLE_TIMES:
-        schedule.every().day.at(t, "Asia/Tokyo").do(lambda: loop.run_until_complete(run_trading_cycle_async_wrapper()))
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    """同期的スケジューラーループ"""
+    try:
+        logging.info("Scheduler thread started.")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        for t in config.TRADING_CYCLE_TIMES:
+            schedule.every().day.at(t, "Asia/Tokyo").do(lambda: loop.run_until_complete(run_trading_cycle_async_wrapper()))
+        
+        # TODO: run_daily_summaryを非同期化してスケジュールに追加
+        # schedule.every().day.at(config.DAILY_SUMMARY_TIME, "Asia/Tokyo").do(...)
+
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
+    except Exception as e:
+        logging.critical(f"Scheduler thread CRASHED: {e}", exc_info=True)
 
 async def run_trading_cycle_async_wrapper():
+    """run_trading_cycle_asyncを呼び出し、サイクル完了時に状態を保存"""
     try:
         await run_trading_cycle_async()
     finally:
