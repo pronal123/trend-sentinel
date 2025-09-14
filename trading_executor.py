@@ -9,9 +9,10 @@ class TradingExecutor:
         self.state = state_manager
         self.exchange = None
         self.ticker_map = {}
-        # ... (APIキー読み込みとccxt初期化は変更なし)
+        # ... (APIキー読み込みとccxt初期化)
 
-    # ... (load_markets, get_ticker_for_id, get_account_balance_usd は変更なし)
+    def get_account_balance_usd(self):
+        # ... (リアルタイム残高取得)
 
     def open_long_position(self, token_id, series, trade_amount_usd, reason="", notifier=None, win_rate=0.0):
         if self.state.has_position(token_id): return
@@ -21,13 +22,13 @@ class TradingExecutor:
             
         available_balance = self.get_account_balance_usd()
         if available_balance < 10:
-            logging.warning(f"Insufficient balance to open position. Skipping."); return
+            logging.warning(f"Insufficient balance. Skipping."); return
         
         actual_trade_amount = min(trade_amount_usd, available_balance)
         
         try:
             series.ta.atr(append=True)
-            atr = series['ATRr_14'].iloc[-1]
+            atr = series['atrr_14'].iloc[-1]
             current_price = series['close'].iloc[-1]
             volatility_ratio = (atr / current_price) * 100
             sl_multiplier, tp_multiplier = (1.2, 2.4) if volatility_ratio > 5.0 else (1.5, 3.0)
@@ -41,7 +42,10 @@ class TradingExecutor:
         
         logging.warning(f"--- SIMULATION: Executing LONG for {token_id} with ${actual_trade_amount:.2f} ---")
         
-        position_details = {'ticker': ticker, 'entry_price': current_price, 'take_profit': take_profit, 'stop_loss': stop_loss, 'position_size': position_size, 'trade_amount_usd': actual_trade_amount}
+        position_details = {
+            'ticker': ticker, 'entry_price': current_price, 'take_profit': take_profit, 
+            'stop_loss': stop_loss, 'position_size': position_size, 'trade_amount_usd': actual_trade_amount
+        }
         self.state.set_position(token_id, True, position_details)
 
         if notifier:
@@ -54,4 +58,8 @@ class TradingExecutor:
             }
             notifier.send_new_position_notification(notification_data)
 
-    # ... (close_long_position, check_active_positions は変更なし)
+    def close_long_position(self, token_id, close_price, reason=""):
+        # ... (決済ロジック)
+
+    def check_active_positions(self, data_aggregator):
+        # ... (TP/SLの監視ロジック)
