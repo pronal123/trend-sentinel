@@ -20,9 +20,6 @@ CHAIN_IDS = {
 class DataAggregator:
     """
     市場データを様々なソースから収集・集約するクラス。
-    - CoinGecko: 各チェーンのトップ銘柄の価格、出来高、変化率
-    - yfinance: 個別銘柄の詳細な日足データ (OHLCV)
-    - alternative.me: Fear & Greed Index
     """
     def __init__(self):
         self.cg = CoinGeckoAPI()
@@ -32,7 +29,6 @@ class DataAggregator:
         """指定されたチェーンのトップ250銘柄の市場データを取得する"""
         logging.info(f"Fetching market data for {chain_id}...")
         try:
-            # CoinGeckoからチェーン内のトップ250銘柄を取得
             coins = self.cg.get_coins_markets(vs_currency='usd', category=CHAIN_IDS[chain_id], per_page=250, page=1, price_change_percentage='1h,24h')
             if not coins:
                 logging.warning(f"No coins data returned for {chain_id}.")
@@ -47,8 +43,7 @@ class DataAggregator:
                 'price_change_percentage_1h_in_currency': 'price_change_1h'
             }, inplace=True)
 
-            # TODO: ここで各銘柄のオンチェーンデータやSNS言及数を取得し、DataFrameに結合する
-            # 以下はダミーデータ (実際のAPIに置き換えてください)
+            # ダミーデータ (実際のAPIに置き換えてください)
             df['volume_change_24h'] = pd.Series(range(100, 100 + len(df) * 5, 5))
             df['volume_15m_multiple'] = pd.Series(range(1, 1 + int(len(df) * 0.1), 1)) * 0.1 + 1
 
@@ -77,19 +72,18 @@ class DataAggregator:
         logging.info(f"Fetching historical OHLCV data for {yf_ticker} ({period}, {interval})...")
         try:
             data = yf.download(yf_ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-            
-            # yfinanceが返す複雑なカラム構造(MultiIndex)をシンプルな形式に変換する修正
+            if data.empty:
+                 return pd.DataFrame()
+
             if isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.get_level_values(0)
             
-            # カラム名を小文字に統一
-            data.columns = [col.lower() for col in data.columns]
+            # カラム名を大文字始まりに統一 (例: 'open' -> 'Open')
+            data.columns = [col.capitalize() for col in data.columns]
             
-            required_cols = {'open', 'high', 'low', 'close', 'volume'}
-            if data.empty or not required_cols.issubset(data.columns):
-                logging.error(f"Failed to fetch valid OHLCV data for {yf_ticker}.")
+            if not {'Open', 'High', 'Low', 'Close', 'Volume'}.issubset(data.columns):
                 return pd.DataFrame()
-                
+
             return data
         except Exception as e:
             logging.error(f"Error fetching OHLCV for {yf_ticker}: {e}")
@@ -102,19 +96,13 @@ class DataAggregator:
             response = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
             response.raise_for_status()
             data = response.json()['data'][0]
-            value = int(data['value'])
-            classification = data['value_classification']
-            logging.info(f"Successfully fetched Fear & Greed Index: {value} ({classification})")
-            return value, classification
+            return int(data['value']), data['value_classification']
         except Exception as e:
             logging.error(f"Failed to fetch Fear & Greed Index: {e}")
             return None, "Unknown"
 
     def get_latest_price(self, token_id):
-        """
-        指定された単一のトークンID（例: 'bitcoin'）の最新のUSD価格を取得する。
-        Webダッシュボードの損益計算に使用する。
-        """
+        """指定された単一トークンIDの最新USD価格を取得する"""
         try:
             price_data = self.cg.get_price(ids=token_id, vs_currencies='usd')
             if token_id in price_data and 'usd' in price_data[token_id]:
