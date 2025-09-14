@@ -10,6 +10,7 @@ CHAIN_IDS = {
     'bnb-chain': 'binance-smart-chain', 'arbitrum': 'arbitrum-one',
     'optimism': 'optimistic-ethereum', 'polygon': 'polygon-pos', 'avalanche': 'avalanche'
 }
+
 class DataAggregator:
     def __init__(self):
         self.cg = CoinGeckoAPI()
@@ -47,7 +48,9 @@ class DataAggregator:
             if data.empty: return pd.DataFrame()
             if isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.get_level_values(0)
-            data.columns = [col.capitalize() for col in data.columns]
+            
+            data.columns = [col.capitalize() for col in data.columns] # THIS IS THE FIX
+            
             if not {'Open', 'High', 'Low', 'Close', 'Volume'}.issubset(data.columns):
                 return pd.DataFrame()
             return data
