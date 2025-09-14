@@ -1,79 +1,62 @@
 # telegram_notifier.py
-import os
-import logging
+import os, logging
 from datetime import datetime
 import pytz
 from telegram import Bot
-from telegram.error import TelegramError # <--- ★★★ インポートをこれだけに修正 ★★★
+from telegram.error import TelegramError
 
 class TelegramNotifier:
-    """
-    Telegramへの通知を専門に担当するクラス。
-    最新のライブラリバージョンに対応したエラーハンドリングを含む。
-    """
     def __init__(self):
-        """
-        コンストラクタ。環境変数から認証情報を読み込み、BOTを初期化する。
-        """
         token = os.environ.get('TELEGRAM_BOT_TOKEN')
         self.chat_id = os.environ.get('TELEGRAM_CHAT_ID')
-
-        if token:
-            logging.info(f"✅ Telegram Token loaded successfully (starts with: {token[:10]}...).")
-        else:
-            logging.error("❌ FATAL: TELEGRAM_BOT_TOKEN environment variable NOT FOUND.")
-        
-        if self.chat_id:
-            logging.info(f"✅ Telegram Chat ID loaded: {self.chat_id}")
-        else:
-            logging.error("❌ FATAL: TELEGRAM_CHAT_ID environment variable NOT FOUND.")
-
         self.bot = Bot(token=token) if token and self.chat_id else None
         if not self.bot:
-            logging.warning("Telegram Bot is not configured. Notifications will be disabled.")
+            logging.warning("Telegram Bot not configured. Notifications are disabled.")
 
-    def send_new_position_notification(self, position_data):
-        """
-        新規ポジション獲得時に、詳細な情報をTelegramに通知する。
-        """
+    def _send_message(self, message):
         if not self.bot: return
-
-        # ... (メッセージを整形する部分は変更なし)
-        p = position_data
-        profit_on_tp = (p['take_profit'] - p['entry_price']) * p['position_size']
-        # ... (以下、メッセージ作成ロジック)
-        message = f"✅ *新規ポジション獲得通知*\n\n通貨: *{p['ticker']}*\n..."
-
-        # --- ▼▼▼ エラーハンドリングを修正 ▼▼▼ ---
         try:
             self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode='Markdown')
-            logging.info(f"Sent new position notification for {p['ticker']}.")
+            return True
         except TelegramError as e:
-            # 親となるTelegramErrorをキャッチし、エラーメッセージの内容で判断する
-            if "Unauthorized" in str(e):
-                logging.error("Telegram Error: Authentication failed. The TELEGRAM_BOT_TOKEN is likely incorrect.")
-            elif "Chat not found" in str(e):
-                logging.error("Telegram Error: Chat not found. The TELEGRAM_CHAT_ID is incorrect or the bot isn't in the chat.")
-            else:
-                logging.error(f"An unexpected Telegram error occurred: {e}")
-        except Exception as e:
-            logging.error(f"An unexpected non-Telegram error occurred while sending notification: {e}")
-        # --- ▲▲▲ ここまで ▲▲▲ ---
+            logging.error(f"Telegram Error: {e}")
+            return False
 
+    def send_new_position_notification(self, p_data):
+        profit_on_tp = (p_data['take_profit'] - p_data['entry_price']) * p_data['position_size']
+        loss_on_sl = (p_data['stop_loss'] - p_data['entry_price']) * p_data['position_size']
+        message = (
+            f"✅ *新規ポジション獲得通知*\n\n"
+            f"通貨: *{p_data['ticker']}*\n参入価格: *${p_data['entry_price']:,.4f}*\n\n"
+            f"--- 資金状況 ---\n総残高: *${p_data['current_balance']:,.2f}*\nポジションサイズ: *{p_data['position_size']:.6f} {p_data['asset']}* (${p_data['trade_amount_usd']:,.2f})\n\n"
+            f"--- 出口戦略 ---\n🟢 利確: *${p_data['take_profit']:,.4f}* (利益: *+${profit_on_tp:,.2f}*)\n🔴 損切: *${p_data['stop_loss']:,.4f}* (損失: *-${abs(loss_on_sl):,.2f}*)\n\n"
+            f"--- パフォーマンス ---\n現在の勝率: *{p_data['win_rate']:.2f}%*\n\n"
+            f"_{p_data['reason']}_"
+        )
+        if self._send_message(message):
+            logging.info(f"Sent new position notification for {p_data['ticker']}.")
 
     def send_position_status_update(self, active_positions):
-        """
-        1時間ごとに現在のポジション状況を通知する。
-        """
-        if not self.bot: return
+        jst = pytz.timezone('Asia/Tokyo')
+        now = datetime.now(jst).strftime('%Y/%m/%d %H:%M JST')
+        message = f"🕒 *ポジション状況 定時報告 ({now})*\n\n"
+        if not active_positions:
+            message += "現在、アクティブなポジションはありません。"
+        else:
+            # ... (前回と同様のメッセージ整形ロジック)
+            pass
+        self._send_message(message)
 
-        # ... (メッセージを整形する部分は変更なし)
-        message = "🕒 *ポジション状況 定時報告...*"
+    def send_close_position_notification(self, ticker, reason, result, pnl):
+        emoji = "🎉" if result == 'win' else "😥"
+        title = "利確" if reason == "TAKE PROFIT" else "損切"
+        message = f"{emoji} *ポジション決済通知*\n\n通貨: *{ticker}*\n決済理由: *{title}*\n確定損益: *${pnl:+.2f}*"
+        self._send_message(message)
 
-        try:
-            self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode='Markdown')
-            logging.info("Sent hourly position status update.")
-        except TelegramError as e:
-            logging.error(f"Failed to send position status update due to Telegram error: {e}")
-        except Exception as e:
-            logging.error(f"Failed to send position status update due to unexpected error: {e}")
+    def send_error_notification(self, error_message):
+        message = f"🚨 *BOTエラー通知*\n\n{error_message}"
+        self._send_message(message)
+
+    def send_daily_summary(self, win_rate, trade_history):
+        # ... (日次サマリーのメッセージ整形と送信)
+        pass
