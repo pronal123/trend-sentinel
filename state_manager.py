@@ -1,24 +1,27 @@
 import json
-import os
 import logging
-from datetime import datetime
+from pathlib import Path
+from statistics import mean
 
 class StateManager:
+    """
+    bot_state.json に勝率・残高・ポジションを永続化
+    """
     def __init__(self, filename="bot_state.json"):
-        self.filename = filename
+        self.filename = Path(filename)
         self.state = {
+            "balance": 10000.0,
             "positions": {},
-            "trade_results": {"win": 0, "loss": 0},
-            "win_rate_history": []
+            "trade_history": []  # {"result":"win/loss"}
         }
         self.load_state()
 
-    # --- ファイルI/O ---
     def load_state(self):
-        if os.path.exists(self.filename):
+        if self.filename.exists():
             try:
                 with open(self.filename, "r") as f:
                     self.state = json.load(f)
+                logging.info("State loaded.")
             except Exception as e:
                 logging.error(f"Failed to load state: {e}")
 
@@ -29,51 +32,32 @@ class StateManager:
         except Exception as e:
             logging.error(f"Failed to save state: {e}")
 
-    # --- 勝率管理 ---
-    def record_trade_result(self, token_id, result: str):
-        """トレード結果を記録し、勝率履歴を更新する"""
-        if result not in ["win", "loss"]:
-            return
-        self.state["trade_results"][result] += 1
+    def get_balance(self):
+        return self.state.get("balance", 0.0)
 
-        win_rate = self.get_win_rate()
-        self.state["win_rate_history"].append({
-            "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            "value": win_rate
-        })
+    def update_balance(self, new_balance: float):
+        self.state["balance"] = new_balance
         self.save_state()
 
-    def get_win_rate(self) -> float:
-        wins = self.state["trade_results"]["win"]
-        losses = self.state["trade_results"]["loss"]
-        total = wins + losses
-        return (wins / total) * 100 if total > 0 else 0.0
+    def get_positions(self):
+        return self.state.get("positions", {})
 
-    def get_win_rate_history(self):
-        return {
-            "timestamps": [x["time"] for x in self.state.get("win_rate_history", [])],
-            "values": [x["value"] for x in self.state.get("win_rate_history", [])]
-        }
-
-    # --- ポジション管理 ---
-    def set_position(self, token_id, is_active: bool, details=None):
-        if is_active:
-            self.state["positions"][token_id] = details or {}
-        else:
-            self.state["positions"].pop(token_id, None)
+    def set_position(self, symbol: str, details: dict):
+        self.state["positions"][symbol] = details
         self.save_state()
 
-    def has_position(self, token_id):
-        return token_id in self.state["positions"]
+    def clear_position(self, symbol: str):
+        if symbol in self.state["positions"]:
+            del self.state["positions"][symbol]
+            self.save_state()
 
-    def get_position_details(self, token_id):
-        return self.state["positions"].get(token_id, {})
+    def record_trade_result(self, result: str):
+        self.state["trade_history"].append({"result": result})
+        self.save_state()
 
-    def get_all_active_positions(self):
-        return self.state["positions"]
-
-    def record_trade_result_and_close(self, token_id, result, pnl=None):
-        """トレード結果を記録しつつポジションを閉じる"""
-        self.record_trade_result(token_id, result)
-        self.set_position(token_id, False, None)
-
+    def get_win_rate(self):
+        history = self.state.get("trade_history", [])
+        if not history:
+            return 0.0
+        wins = sum(1 for h in history if h["result"] == "win")
+        return round(wins / len(history) * 100, 2)
