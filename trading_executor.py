@@ -14,14 +14,11 @@ class TradingExecutor:
     def __init__(self, state_manager):
         self.state = state_manager
         self.exchange = None
-        
-        # configから市場タイプを読み込む ('spot' or 'swap')
         self.market_type = config.EXCHANGE_MARKET_TYPE
         
         if config.PAPER_TRADING_ENABLED:
             logging.warning("Paper Trading is ENABLED. No real orders will be placed.")
         
-        # APIキーがなければ初期化しない
         if not all([config.EXCHANGE_ID, config.EXCHANGE_API_KEY, config.EXCHANGE_SECRET_KEY]):
             logging.error("API credentials are not fully set in config/environment.")
             return
@@ -44,36 +41,32 @@ class TradingExecutor:
 
     def get_ticker_for_id(self, coingecko_id):
         symbol_upper = coingecko_id.split('-')[0].upper()
-        # 先物の場合、':USDT'などのサフィックスが必要な取引所がある
         return f"{symbol_upper}/USDT:USDT" if self.market_type == 'swap' else f"{symbol_upper}/USDT"
 
     def calculate_position_size(self, score):
-        """スコア(0-100)に基づいてポジションサイズ(USD)を動的に計算する"""
-        entry_threshold = config.ENTRY_SCORE_THRESHOLD_TRENDING # 仮。実際はmainから渡されるべき
+        entry_threshold = config.ENTRY_SCORE_THRESHOLD_TRENDING
         if score < entry_threshold:
             return 0.0
-        
-        # スコアが閾値で基本サイズ、100点で最大サイズになるよう線形に計算
         size = config.BASE_POSITION_SIZE_USD + ((score - entry_threshold) / (100 - entry_threshold)) * (config.MAX_POSITION_SIZE_USD - config.BASE_POSITION_SIZE_USD)
         return round(size, 2)
 
-    def open_position(self, signal_type, token_id, series, score, notifier=None, analysis_comment=""):
+    def open_position(self, signal_type, token_id, series, score, notifier=None, analysis_comment="", position_size_usd=0):
         if self.state.has_position(token_id):
             logging.warning(f"Position for {token_id} already exists. Skipping open.")
             return
 
-        # 1. ショート取引の実行可否をconfig設定に基づき判断
         if signal_type == 'SHORT' and not config.ENABLE_FUTURES_TRADING:
-            logging.warning("SHORT signal received, but futures trading is disabled in config. Skipping.")
+            logging.warning("SHORT signal received, but futures trading is disabled. Skipping.")
             return
+        
+        # ポジションサイズが渡されなかった場合、スコアから計算
+        if position_size_usd <= 0:
+            position_size_usd = self.calculate_position_size(score)
 
-        # 2. スコアに基づきポジションサイズを決定
-        position_size_usd = self.calculate_position_size(score)
         if position_size_usd <= 0:
             logging.info(f"Low score for {token_id} ({score:.1f}). Not opening position.")
             return
 
-        # 3. リスク管理（利食い・損切り）ラインをATRで計算
         try:
             series.ta.atr(append=True)
             atr = series['ATRr_14'].iloc[-1]
@@ -90,21 +83,18 @@ class TradingExecutor:
             logging.error(f"Failed to calculate SL/TP for {token_id}: {e}")
             return
 
-        # 4. 注文を実行
         ticker = self.get_ticker_for_id(token_id)
         try:
-            logging.info(f"Attempting to open {signal_type} position for {ticker} | Size: ${position_size_usd:.2f} | SL: {stop_loss:.4f} | TP: {take_profit:.4f}")
+            logging.info(f"Attempting to open {signal_type} position for {ticker} | Size: ${position_size_usd:.2f}")
             
             if config.PAPER_TRADING_ENABLED:
                 logging.warning(f"--- SIMULATION: Executed {signal_type} for {token_id} ---")
             elif self.exchange:
                 if signal_type == 'LONG':
-                    order = self.exchange.create_market_buy_order(ticker, position_size_asset)
+                    self.exchange.create_market_buy_order(ticker, position_size_asset)
                 elif signal_type == 'SHORT':
-                    order = self.exchange.create_market_sell_order(ticker, position_size_asset)
-                logging.info(f"SUCCESS: {signal_type} order placed for {ticker}. Order ID: {order['id']}")
+                    self.exchange.create_market_sell_order(ticker, position_size_asset)
             
-            # 5. ポジション情報を記録・通知
             position_details = {
                 'ticker': ticker, 'side': signal_type.lower(), 'entry_price': current_price,
                 'take_profit': take_profit, 'stop_loss': stop_loss, 'position_size': position_size_asset
@@ -112,16 +102,60 @@ class TradingExecutor:
             self.state.set_position(token_id, True, position_details)
             if notifier:
                 notifier.send_new_position_notification(position_details, score, analysis_comment)
-
         except Exception as e:
             logging.error(f"Failed to open {signal_type} position for {ticker}: {e}")
-            if notifier: notifier.send_error_notification(f"注文失敗 ({ticker}): {e}")
 
     def close_position(self, token_id, close_price, reason, notifier=None):
         if not self.state.has_position(token_id): return
         
         details = self.state.get_position_details(token_id)
-        # ... (決済ロジックは前回回答から変更なし) ...
+        ticker, position_size, side = details['ticker'], details['position_size'], details['side']
+        
+        try:
+            logging.info(f"Attempting to close {side} position for {ticker} due to {reason}.")
+
+            if config.PAPER_TRADING_ENABLED:
+                logging.warning(f"--- SIMULATION: Closed {side} for {token_id} ---")
+            elif self.exchange:
+                if side == 'long':
+                    self.exchange.create_market_sell_order(ticker, position_size)
+                elif side == 'short':
+                    self.exchange.create_market_buy_order(ticker, position_size, {'reduceOnly': True})
+
+            pnl = (close_price - details['entry_price']) * position_size if side == 'long' else (details['entry_price'] - close_price) * position_size
+            result = 'win' if pnl > 0 else 'loss'
+            
+            self.state.record_trade_result(token_id, result)
+            self.state.set_position(token_id, False, None)
+            if notifier:
+                notifier.send_close_position_notification(ticker, reason, result, pnl)
+        except Exception as e:
+            logging.error(f"Failed to close position for {ticker}: {e}")
 
     def check_active_positions(self, data_aggregator, notifier=None):
-        # ... (アクティブポジションの監視ロジックは前回回答から変更なし) ...
+        """
+        保有中の全ポジションを監視し、利食い/損切りラインに達していないか確認する。
+        """
+        active_positions = self.state.get_all_active_positions()
+        if not active_positions: return
+
+        logging.info(f"Checking {len(active_positions)} active position(s)...")
+        for token_id, details in active_positions.items():
+            try:
+                # data_aggregatorに最新価格を取得する機能が必要
+                current_price = data_aggregator.get_latest_price(token_id)
+                if not current_price: continue
+
+                side = details['side']
+                if side == 'long':
+                    if current_price >= details['take_profit']:
+                        self.close_position(token_id, current_price, "TAKE PROFIT", notifier)
+                    elif current_price <= details['stop_loss']:
+                        self.close_position(token_id, current_price, "STOP LOSS", notifier)
+                elif side == 'short':
+                    if current_price <= details['take_profit']:
+                        self.close_position(token_id, current_price, "TAKE PROFIT", notifier)
+                    elif current_price >= details['stop_loss']:
+                        self.close_position(token_id, current_price, "STOP LOSS", notifier)
+            except Exception as e:
+                logging.error(f"Could not check position for {token_id}: {e}")
