@@ -1,75 +1,72 @@
 import json
 import os
-import datetime
-import logging
+from datetime import datetime, timezone
 
+STATE_FILE = "bot_state.json"
 
 class StateManager:
-    def __init__(self, state_file="bot_state.json"):
-        self.state_file = state_file
+    def __init__(self):
         self.state = {
-            "balance": 10000.0,
+            "balance": 10000.0,  # 初期残高
             "positions": {},
-            "summary": {},
-            "balance_history": [],
-            "daily_returns": {},
-            "trade_history": []  # 直近1000件保持
+            "trade_history": []
         }
-        self.load_state()
+        self._load_state()
 
-    # -------------------------
-    # 状態ロード/セーブ
-    # -------------------------
-    def load_state(self):
-        if os.path.exists(self.state_file):
-            try:
-                with open(self.state_file, "r") as f:
-                    self.state = json.load(f)
-            except Exception as e:
-                logging.error(f"Failed to load state: {e}")
+    def _load_state(self):
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                self.state = json.load(f)
 
-    def save_state(self):
-        try:
-            with open(self.state_file, "w") as f:
-                json.dump(self.state, f, indent=2)
-        except Exception as e:
-            logging.error(f"Failed to save state: {e}")
+    def _save_state(self):
+        with open(STATE_FILE, "w") as f:
+            json.dump(self.state, f, indent=2)
 
-    # -------------------------
-    # トレード結果記録
-    # -------------------------
-    def record_trade_result(self, symbol, side, pnl, balance):
-        now = datetime.datetime.now().isoformat()
+    def get_balance(self):
+        return self.state["balance"]
 
-        trade = {
-            "timestamp": now,
+    def update_balance(self, amount):
+        self.state["balance"] += amount
+        self._save_state()
+
+    def open_position(self, symbol, entry_price, size, take_profit, stop_loss):
+        self.state["positions"][symbol] = {
+            "entry_price": entry_price,
+            "size": size,
+            "take_profit": take_profit,
+            "stop_loss": stop_loss,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        self._save_state()
+
+    def close_position(self, symbol, exit_price, reason="TP/SL"):
+        if symbol not in self.state["positions"]:
+            return None
+
+        pos = self.state["positions"].pop(symbol)
+        pnl = (exit_price - pos["entry_price"]) * pos["size"]
+        pnl_pct = pnl / (pos["entry_price"] * pos["size"]) * 100
+
+        record = {
             "symbol": symbol,
-            "side": side,
-            "pnl": float(pnl),
-            "balance": float(balance),
-            "return_pct": (pnl / balance * 100) if balance > 0 else 0.0,
+            "entry_price": pos["entry_price"],
+            "exit_price": exit_price,
+            "take_profit": pos["take_profit"],
+            "stop_loss": pos["stop_loss"],
+            "size": pos["size"],
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "reason": reason,
+            "opened_at": pos["timestamp"],
+            "closed_at": datetime.now(timezone.utc).isoformat()
         }
+        self.state["trade_history"].append(record)
+        self.update_balance(pnl)
+        self._save_state()
+        return record
 
-        # trade_history に追加（直近1000件）
-        self.state.setdefault("trade_history", [])
-        self.state["trade_history"].append(trade)
-        if len(self.state["trade_history"]) > 1000:
-            self.state["trade_history"] = self.state["trade_history"][-1000:]
+    def get_positions(self):
+        return self.state["positions"]
 
-        # balance と履歴
-        self.state["balance"] = float(balance)
-        self.state.setdefault("balance_history", [])
-        self.state["balance_history"].append({
-            "timestamp": now,
-            "balance": float(balance)
-        })
-        if len(self.state["balance_history"]) > 2000:
-            self.state["balance_history"] = self.state["balance_history"][-2000:]
-
-        self.save_state()
-
-    # -------------------------
-    # スナップショット取得
-    # -------------------------
-    def get_state_snapshot(self):
-        return self.state
+    def get_trade_history(self):
+        return self.state["trade_history"]
