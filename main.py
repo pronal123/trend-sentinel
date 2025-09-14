@@ -6,7 +6,7 @@ import logging
 import asyncio
 import atexit
 from flask import Flask
-from concurrent.futures import ThreadPoolExecutor
+import pandas as pd
 
 # --- 1. モジュールと設定をインポート ---
 import config
@@ -29,20 +29,12 @@ notifier = TelegramNotifier()
 app = Flask(__name__)
 
 # --- 3. 永続化とWebサーバー機能 ---
-@app.before_first_request
-def before_first_request():
-    if not hasattr(app, 'is_initialized'):
-        state.load_state_from_disk()
-        app.is_initialized = True
-
+# プログラム終了時に状態をファイルに保存する処理を登録
 atexit.register(state.save_state_to_disk)
 
 @app.route('/')
 def health_check():
-    """
-    RenderのヘルスチェックやUptimeRobotからのアクセスに応答する。
-    この関数の下に、正しくインデントされたコードが必要です。
-    """
+    """RenderのヘルスチェックやUptimeRobotからのアクセスに応答する"""
     bot_status = 'ACTIVE' if config.IS_BOT_ACTIVE else 'INACTIVE'
     position_count = len(state.get_all_active_positions())
     return f"✅ Auto Trading Bot is {bot_status}. Active Positions: {position_count}"
@@ -53,8 +45,10 @@ async def analyze_candidate_async(candidate, signal_type, fng_data, time_frame):
     yf_ticker = f"{candidate['symbol'].upper()}-USD"
     
     loop = asyncio.get_event_loop()
+    # yfinanceの同期的な呼び出しを、非同期コードをブロックしないようにスレッドプールで実行
     series = await loop.run_in_executor(None, data_agg.fetch_ohlcv, yf_ticker, time_frame['period'], time_frame['interval'])
-    if series.empty: return None
+    if series.empty:
+        return None
     
     score, analysis, regime = scorer.generate_score_and_analysis(candidate, series, fng_data, signal_type)
     entry_threshold = config.ENTRY_SCORE_THRESHOLD_TRENDING if regime == 'TRENDING' else config.ENTRY_SCORE_THRESHOLD_RANGING
@@ -62,6 +56,7 @@ async def analyze_candidate_async(candidate, signal_type, fng_data, time_frame):
     if score >= entry_threshold:
         return {'type': signal_type, 'token': candidate, 'series': series, 'score': score, 'analysis': analysis}
     elif score >= entry_threshold * 0.7:
+        # スコアが閾値に近ければ、次の機会のためにウォッチリストに追加
         state.update_watchlist(candidate['id'], score)
     
     return None
@@ -74,14 +69,14 @@ async def run_trading_cycle_async():
         
     logging.info("--- 🚀 Starting New Intelligent Trading Cycle ---")
 
-    # フェーズ1: 既存ポジションとBOTの自己評価
+    # フェーズ1: 既存ポジションの監視とBOTの自己評価
     trader.check_active_positions(data_agg, notifier=notifier)
     win_rate = state.get_win_rate()
     logging.info(f"Current Bot Win Rate: {win_rate:.2f}%")
 
     # フェーズ2: ポートフォリオのリスク管理
     if len(state.get_all_active_positions()) >= config.MAX_OPEN_POSITIONS:
-        logging.warning(f"Max positions reached. Skipping new signal generation.")
+        logging.warning(f"Max positions ({config.MAX_OPEN_POSITIONS}) reached. Skipping new signal generation.")
         return
 
     # フェーズ3: 市場状況把握と分析戦略の決定
@@ -95,10 +90,10 @@ async def run_trading_cycle_async():
     volatility = btc_series_daily['ATRp_14'].iloc[-1]
     if volatility > 4.0:
         time_frame = {'period': '7d', 'interval': '1h'}
-        logging.info(f"High volatility detected. Using SHORT-TERM (1h) analysis.")
+        logging.info(f"High volatility detected (BTC ATRp: {volatility:.2f}%). Using SHORT-TERM (1h) analysis.")
     else:
         time_frame = {'period': '60d', 'interval': '4h'}
-        logging.info(f"Low volatility detected. Using MID-TERM (4h) analysis.")
+        logging.info(f"Low volatility detected (BTC ATRp: {volatility:.2f}%). Using MID-TERM (4h) analysis.")
 
     # フェーズ4: 分析候補のリストアップ
     all_data = data_agg.get_all_chains_data()
@@ -128,6 +123,7 @@ async def run_trading_cycle_async():
             trade = best_trade_candidate
             logging.info(f"HIGH-CONFIDENCE SIGNAL found: {trade['token']['symbol'].upper()} ({trade['type']}), Score: {trade['score']:.1f}")
             
+            # 勝率に応じて最大取引額を調整
             adjusted_max_size = config.MAX_POSITION_SIZE_USD * (win_rate / 100) if win_rate > 50 else config.BASE_POSITION_SIZE_USD
             position_size = trader.calculate_position_size(config.BASE_POSITION_SIZE_USD, adjusted_max_size, trade['score'])
             
@@ -142,17 +138,28 @@ async def run_trading_cycle_async():
 
 # --- 5. スケジューラとプログラム起動 ---
 def run_scheduler():
+    """スケジュールを管理し、非同期タスクを呼び出す"""
     logging.info("Scheduler started.")
+    
     async def periodic_task():
+        # 6時間ごとに取引サイクルを実行するタスク
+        # TODO: config.pyのスケジュール設定を読み込むように改良
         while True:
             await run_trading_cycle_async()
-            state.save_state_to_disk()
-            await asyncio.sleep(6 * 3600)
+            state.save_state_to_disk() # サイクルごとに状態を保存
+            await asyncio.sleep(6 * 3600) # 6時間待機
+
+    # メインの非同期ループを開始
     asyncio.run(periodic_task())
 
 if __name__ == "__main__":
     logging.info("Initializing Bot...")
+    # BOTのメインロジックを開始する前に、状態をファイルから読み込む
     state.load_state_from_disk()
+    
+    # BOTのメインロジック(スケジューラ)をバックグラウンドスレッドで実行
     threading.Thread(target=run_scheduler, daemon=True).start()
+    
+    # Webサーバーをメインスレッドで実行
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
