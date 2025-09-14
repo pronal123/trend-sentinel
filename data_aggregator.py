@@ -31,10 +31,8 @@ class DataAggregator:
             return pd.DataFrame()
 
     def get_all_chains_data(self):
-        all_data = []
-        for chain_name in CHAIN_IDS.keys():
-            chain_data = self.get_market_data(chain_name)
-            if not chain_data.empty: chain_data['chain'] = chain_name; all_data.append(chain_data)
+        all_data = [self.get_market_data(name) for name in CHAIN_IDS.keys()]
+        all_data = [df for df in all_data if not df.empty]
         if not all_data: return pd.DataFrame()
         return pd.concat(all_data, ignore_index=True)
 
