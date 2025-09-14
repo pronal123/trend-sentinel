@@ -1,151 +1,161 @@
 import requests
-import pandas as pd
+import yfinance as yf
 import logging
+from datetime import datetime, timedelta
+import pytz
 import ccxt
-import datetime
+import random
 
-# Fear & Greed Index
-def get_fear_greed_index():
-    try:
-        url = "https://api.alternative.me/fng/"
-        res = requests.get(url, timeout=10).json()
-        return int(res["data"][0]["value"])
-    except Exception as e:
-        logging.error(f"Fear & Greed Index fetch failed: {e}")
-        return 50
 
-# Coingecko トレンド銘柄
-def get_coingecko_trending():
-    try:
-        url = "https://api.coingecko.com/api/v3/search/trending"
-        res = requests.get(url, timeout=10).json()
-        coins = [item["item"]["symbol"].upper() for item in res["coins"]]
-        return coins[:5]  # 上位5銘柄
-    except Exception as e:
-        logging.error(f"Coingecko trending fetch failed: {e}")
-        return []
+class DataAggregator:
+    def __init__(self):
+        self.bitget = ccxt.bitget()
+        self.coingecko_url = "https://api.coingecko.com/api/v3"
 
-# Bitgetから価格履歴（1分足）
-def fetch_price_history(symbol: str, market_type="spot", limit=200):
-    try:
-        ex = ccxt.bitget({"options": {"defaultType": market_type}})
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe="1m", limit=limit)
-        df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        return df
-    except Exception as e:
-        logging.error(f"Price history fetch failed ({symbol}): {e}")
-        return pd.DataFrame()
+    # ==============================
+    # BTC価格履歴（1分足）
+    # ==============================
+    def get_btc_price_history(self, minutes=60):
+        try:
+            df = yf.download("BTC-USD", period="1h", interval="1m")
+            return df["Close"].tolist()
+        except Exception as e:
+            logging.error(f"BTC price history fetch failed: {e}")
+            return []
 
-# Bitgetから板データ
-def get_orderbook(symbol: str, market_type="spot"):
-    try:
-        ex = ccxt.bitget({"options": {"defaultType": market_type}})
-        return ex.fetch_order_book(symbol, limit=20)
-    except Exception as e:
-        logging.error(f"Orderbook fetch failed ({symbol}): {e}")
-        return {"bids": [], "asks": []}
+    # ==============================
+    # Fear & Greed Index
+    # ==============================
+    def get_fear_greed_index(self):
+        try:
+            res = requests.get("https://api.alternative.me/fng/")
+            data = res.json()
+            return {
+                "value": data["data"][0]["value"],
+                "classification": data["data"][0]["value_classification"]
+            }
+        except Exception as e:
+            logging.error(f"Fear & Greed Index fetch failed: {e}")
+            return {"value": None, "classification": "Unknown"}
 
-# TP/SL計算
-def calculate_tp_sl(df, orderbook, fng_index):
-    if df.empty:
-        return None, None
-    current_price = df["close"].iloc[-1]
+    # ==============================
+    # CoinGecko トレンド銘柄
+    # ==============================
+    def get_trending_coins(self, limit=5):
+        try:
+            res = requests.get(f"{self.coingecko_url}/search/trending")
+            data = res.json()
+            return [item["item"]["symbol"].upper() for item in data["coins"][:limit]]
+        except Exception as e:
+            logging.error(f"Trending coins fetch failed: {e}")
+            return ["BTC"]
 
-    # ATR計算
-    df["H-L"] = df["high"] - df["low"]
-    df["H-C"] = (df["high"] - df["close"].shift()).abs()
-    df["L-C"] = (df["low"] - df["close"].shift()).abs()
-    df["TR"] = df[["H-L","H-C","L-C"]].max(axis=1)
-    atr = df["TR"].rolling(14).mean().iloc[-1]
+    # ==============================
+    # ニュース記事（英語 & 日本語）
+    # ==============================
+    def get_news(self, limit=5):
+        news = []
+        try:
+            # 英語ニュース（NewsAPI例: crypto）
+            res = requests.get(
+                "https://cryptopanic.com/api/v1/posts/?auth_token=demo&currencies=BTC"
+            )
+            if res.status_code == 200:
+                data = res.json()
+                for item in data.get("results", [])[:limit]:
+                    news.append({"title": item["title"], "source": "CryptoPanic"})
+        except Exception as e:
+            logging.warning(f"English news fetch failed: {e}")
 
-    sl_mult, tp_mult = 1.5, 2.5
+        try:
+            # 日本語ニュース（CoinPost RSS）
+            rss = requests.get("https://coinpost.jp/?feed=rss2")
+            if rss.status_code == 200:
+                from xml.etree import ElementTree as ET
+                root = ET.fromstring(rss.content)
+                for item in root.findall(".//item")[:limit]:
+                    title = item.find("title").text
+                    news.append({"title": title, "source": "CoinPost"})
+        except Exception as e:
+            logging.warning(f"Japanese news fetch failed: {e}")
 
-    # 板厚で補正
-    try:
-        buy_liquidity = sum([o[1] for o in orderbook["bids"][:10]])
-        sell_liquidity = sum([o[1] for o in orderbook["asks"][:10]])
-        if buy_liquidity > sell_liquidity * 1.5:
-            tp_mult += 0.5
-        elif sell_liquidity > buy_liquidity * 1.5:
-            sl_mult += 0.5
-    except:
-        pass
+        return news[:limit]
 
-    # 恐怖指数補正
-    if fng_index >= 70:
-        tp_mult -= 0.5
-    elif fng_index <= 30:
-        sl_mult += 0.5
+    # ==============================
+    # 板の厚み分析（Bitget）
+    # ==============================
+    def get_orderbook_analysis(self, symbol="BTC/USDT"):
+        try:
+            orderbook = self.bitget.fetch_order_book(symbol, limit=50)
+            bid_volume = sum([b[1] for b in orderbook["bids"]])
+            ask_volume = sum([a[1] for a in orderbook["asks"]])
+            imbalance = (bid_volume - ask_volume) / max(bid_volume + ask_volume, 1)
+            return {
+                "bid_volume": bid_volume,
+                "ask_volume": ask_volume,
+                "imbalance": imbalance
+            }
+        except Exception as e:
+            logging.error(f"Orderbook fetch failed: {e}")
+            return {"bid_volume": 0, "ask_volume": 0, "imbalance": 0}
 
-    take_profit = round(current_price + atr * tp_mult, 4)
-    stop_loss = round(current_price - atr * sl_mult, 4)
+    # ==============================
+    # 利確／損切ポイント算出
+    # ==============================
+    def calc_takeprofit_stoploss(self, price, imbalance):
+        tp = price * (1.02 + imbalance * 0.01)  # 板の厚みで調整
+        sl = price * (0.98 - imbalance * 0.01)
+        return round(tp, 2), round(sl, 2)
 
-    return take_profit, stop_loss
+    # ==============================
+    # コメント生成（AI風）
+    # ==============================
+    def generate_comment(self, symbol, price, orderbook, fg_index):
+        if orderbook["imbalance"] > 0.2:
+            bias = "買い支えが強く上昇しやすい"
+        elif orderbook["imbalance"] < -0.2:
+            bias = "売り圧力が強く下落注意"
+        else:
+            bias = "方向感は限定的"
+        return (
+            f"{symbol} の現在価格は {price} USD。"
+            f"板状況は {bias}。恐怖指数は {fg_index['value']} ({fg_index['classification']})。"
+            "利確・損切を意識しながら取引判断を。"
+        )
 
-# コメント生成
-def generate_comment(symbol, df, fng_index, orderbook, tp, sl):
-    if df.empty:
-        return f"{symbol}: データ取得失敗"
+    # ==============================
+    # 総合スナップショット構築
+    # ==============================
+    def build_market_snapshot(self, state):
+        snapshot = {}
+        fg_index = self.get_fear_greed_index()
+        trending = self.get_trending_coins()
+        news = self.get_news()
 
-    current_price = df["close"].iloc[-1]
-    change_1h = (df["close"].iloc[-1] / df["close"].iloc[-60] - 1) * 100 if len(df) > 60 else 0
-    change_24h = (df["close"].iloc[-1] / df["close"].iloc[-1440] - 1) * 100 if len(df) > 1440 else 0
-    rsi = calculate_rsi(df["close"])
+        target_symbols = ["BTC/USDT"]
+        target_symbols += [f"{sym}/USDT" for sym in trending]
+        target_symbols += [f"{sym}/USDT" for sym in state.get_positions().keys()]
+        target_symbols = list(set(target_symbols))  # 重複排除
 
-    comment = (
-        f"📊 {symbol} 市場分析\n"
-        f"- 現在価格: {current_price:.4f} USDT\n"
-        f"- 1時間変動: {change_1h:.2f}% | 24時間変動: {change_24h:.2f}%\n"
-        f"- RSI: {rsi:.1f}\n"
-        f"- 恐怖指数: {fng_index}\n"
-    )
-    if tp and sl:
-        comment += f"🎯 利確目安: {tp} | 🛑 損切目安: {sl}\n"
+        for sym in target_symbols:
+            try:
+                ticker = self.bitget.fetch_ticker(sym)
+                price = ticker["last"]
+                ob = self.get_orderbook_analysis(sym)
+                tp, sl = self.calc_takeprofit_stoploss(price, ob["imbalance"])
+                comment = self.generate_comment(sym, price, ob, fg_index)
 
-    if rsi > 70:
-        comment += "💡 RSI過熱 → 上昇一服の可能性あり\n"
-    elif rsi < 30:
-        comment += "💡 RSI低水準 → 反発狙いの局面\n"
-    else:
-        comment += "💡 中立圏 → 板の厚みに注目\n"
+                snapshot[sym] = {
+                    "last_price": price,
+                    "take_profit": tp,
+                    "stop_loss": sl,
+                    "orderbook": ob,
+                    "fear_greed": fg_index,
+                    "comment": comment,
+                }
+            except Exception as e:
+                logging.warning(f"Snapshot error for {sym}: {e}")
 
-    return comment
-
-# RSI計算
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs)).iloc[-1]
-
-# 全体スナップショット構築
-def build_market_snapshot(state_manager):
-    snapshot = {}
-    fng_index = get_fear_greed_index()
-
-    # ウォッチリスト
-    watchlist = ["BTC/USDT"]
-    positions = state_manager.get_all_active_positions()
-    for token_id in positions.keys():
-        watchlist.append(f"{token_id.upper()}/USDT")
-    trending = get_coingecko_trending()
-    for coin in trending:
-        watchlist.append(f"{coin.upper()}/USDT")
-
-    watchlist = list(set(watchlist))
-
-    for symbol in watchlist:
-        df = fetch_price_history(symbol, market_type="spot")
-        orderbook = get_orderbook(symbol, market_type="spot")
-        tp, sl = calculate_tp_sl(df, orderbook, fng_index)
-        comment = generate_comment(symbol, df, fng_index, orderbook, tp, sl)
-        snapshot[symbol] = {
-            "last_price": df["close"].iloc[-1] if not df.empty else None,
-            "take_profit": tp,
-            "stop_loss": sl,
-            "comment": comment,
-        }
-
-    return snapshot
+        snapshot["_news"] = news
+        snapshot["_updated_at"] = datetime.now(pytz.timezone("Asia/Tokyo")).isoformat()
+        return snapshot
