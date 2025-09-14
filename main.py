@@ -5,6 +5,8 @@ import time
 import logging
 import asyncio
 import atexit
+import schedule
+import pytz
 from flask import Flask, render_template_string
 import pandas as pd
 
@@ -160,13 +162,11 @@ def status_dashboard():
 
 # --- 4. 非同期対応の分析・取引ロジック ---
 async def analyze_candidate_async(candidate, signal_type, fng_data, time_frame):
-    """非同期で単一の候補を分析するコルーチン（動的タイムフレーム対応）"""
     yf_ticker = f"{candidate['symbol'].upper()}-USD"
     
     loop = asyncio.get_event_loop()
     series = await loop.run_in_executor(None, data_agg.fetch_ohlcv, yf_ticker, time_frame['period'], time_frame['interval'])
-    if series.empty:
-        return None
+    if series.empty: return None
     
     score, analysis, regime = scorer.generate_score_and_analysis(candidate, series, fng_data, signal_type)
     entry_threshold = config.ENTRY_SCORE_THRESHOLD_TRENDING if regime == 'TRENDING' else config.ENTRY_SCORE_THRESHOLD_RANGING
@@ -179,7 +179,6 @@ async def analyze_candidate_async(candidate, signal_type, fng_data, time_frame):
     return None
 
 async def run_trading_cycle_async():
-    """非同期で実行されるメインの取引サイクル"""
     if not config.IS_BOT_ACTIVE:
         logging.warning("BOT is INACTIVE. Skipping cycle.")
         return
@@ -245,19 +244,32 @@ async def run_trading_cycle_async():
 
 # --- 5. スケジューラとプログラム起動 ---
 def run_scheduler():
+    """スケジュールを管理し、非同期タスクを呼び出す"""
     logging.info("Scheduler started.")
     
-    async def periodic_task():
-        while True:
-            await run_trading_cycle_async()
-            state.save_state_to_disk()
-            await asyncio.sleep(6 * 3600)
+    # asyncioイベントループを現在のスレッド用に取得または作成
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # スケジュールジョブを定義
+    for t in config.TRADING_CYCLE_TIMES:
+        schedule.every().day.at(t, "Asia/Tokyo").do(lambda: loop.create_task(run_trading_cycle_async()))
+    # schedule.every().day.at(config.DAILY_SUMMARY_TIME, "Asia/Tokyo").do(run_daily_summary)
 
-    asyncio.run(periodic_task())
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
 if __name__ == "__main__":
     logging.info("Initializing Bot...")
     state.load_state_from_disk()
+    
     threading.Thread(target=run_scheduler, daemon=True).start()
+    
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # 本番環境ではGunicornがWSGIサーバーとして動作するため、app.runは不要
+    # ローカルでのテスト実行の場合のみ、以下の行のコメントを外す
+    # app.run(host='0.0.0.0', port=port, debug=False)
