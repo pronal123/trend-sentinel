@@ -1,90 +1,89 @@
-import yfinance as yf
 import pandas as pd
+import numpy as np
 import logging
-import requests
-import json
-import os
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from data_aggregator import DataAggregator
-
-load_dotenv()
-
+import matplotlib.pyplot as plt
 
 class Backtester:
-    def __init__(self, interval="5m", period="30d", state_file="bot_state.json", cache_file="trending_cache.json"):
-        self.interval = interval
-        self.period = period
-        self.aggregator = DataAggregator()
-        self.state_file = state_file
-        self.cache_file = cache_file
-        self.coingecko_key = os.getenv("COINGECKO_API_KEY")
+    def __init__(self, initial_balance=10000):
+        self.balance = initial_balance
+        self.trades = []
 
-    # --- トレンドキャッシュを管理 ---
-    def _load_trending_cache(self):
-        if os.path.exists(self.cache_file):
-            with open(self.cache_file, "r") as f:
-                return json.load(f)
-        return []
+    def calculate_atr(self, df: pd.DataFrame, period=14):
+        if len(df) < period:
+            return None
+        high = df['high']
+        low = df['low']
+        close = df['close'].shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - close).abs(),
+            (low - close).abs()
+        ], axis=1).max(axis=1)
+        return tr.rolling(period).mean().iloc[-1]
 
-    def _save_trending_cache(self, data):
-        with open(self.cache_file, "w") as f:
-            json.dump(data, f, indent=2)
+    def run(self, df: pd.DataFrame, symbol: str, side: str):
+        logging.info(f"バックテスト開始: {symbol} {side}")
+        for i in range(30, len(df)):
+            subset = df.iloc[:i].copy()
+            atr = self.calculate_atr(subset)
+            if atr is None or np.isnan(atr):
+                continue
 
-    # --- 動的銘柄リスト生成 ---
-    def get_dynamic_symbols(self):
-        symbols = set()
-        now = datetime.utcnow()
-        trending_cache = self._load_trending_cache()
+            entry_price = df.iloc[i]['close']
+            if side == "LONG":
+                take_profit = entry_price + atr * 2
+                stop_loss = entry_price - atr
+            else:
+                take_profit = entry_price - atr * 2
+                stop_loss = entry_price + atr
 
-        # Coingecko トレンド銘柄（TOP7）
-        try:
-            url = "https://api.coingecko.com/api/v3/search/trending"
-            headers = {"accept": "application/json"}
-            if self.coingecko_key:
-                headers["x-cg-pro-api-key"] = self.coingecko_key
-            res = requests.get(url, headers=headers, timeout=10).json()
+            outcome = None
+            exit_price = None
 
-            new_entries = []
-            for item in res.get("coins", []):
-                symbol = item["item"]["symbol"].upper()
-                symbol_full = f"{symbol}-USD"
-                symbols.add(symbol_full)
-                new_entries.append({"symbol": symbol_full, "time": now.isoformat()})
+            for j in range(i+1, len(df)):
+                high = df.iloc[j]['high']
+                low = df.iloc[j]['low']
+                if side == "LONG":
+                    if low <= stop_loss:
+                        outcome = "LOSS"
+                        exit_price = stop_loss
+                        break
+                    elif high >= take_profit:
+                        outcome = "WIN"
+                        exit_price = take_profit
+                        break
+                else:
+                    if high >= stop_loss:
+                        outcome = "LOSS"
+                        exit_price = stop_loss
+                        break
+                    elif low <= take_profit:
+                        outcome = "WIN"
+                        exit_price = take_profit
+                        break
 
-            # キャッシュに追加
-            trending_cache.extend(new_entries)
+            if outcome:
+                pnl = (exit_price - entry_price) if side == "LONG" else (entry_price - exit_price)
+                self.balance += pnl
+                self.trades.append({
+                    "symbol": symbol,
+                    "side": side,
+                    "entry": entry_price,
+                    "exit": exit_price,
+                    "outcome": outcome,
+                    "pnl": pnl,
+                    "balance": self.balance
+                })
 
-        except Exception as e:
-            logging.error(f"Coingecko fetch error: {e}")
+        return pd.DataFrame(self.trades)
 
-        # 24時間以内の履歴を残す
-        cutoff = now - timedelta(hours=24)
-        trending_cache = [entry for entry in trending_cache if datetime.fromisoformat(entry["time"]) >= cutoff]
-        self._save_trending_cache(trending_cache)
-
-        # 24h 履歴を追加
-        for entry in trending_cache:
-            symbols.add(entry["symbol"])
-
-        # 保有ポジション銘柄（state_manager 管理）
-        try:
-            with open(self.state_file, "r") as f:
-                state = json.load(f)
-                positions = state.get("positions", {})
-                for sym in positions.keys():
-                    symbols.add(f"{sym}-USD")
-        except Exception as e:
-            logging.warning(f"Could not load state file: {e}")
-
-        # デフォルト主要銘柄
-        default = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD"]
-        symbols.update(default)
-
-        logging.info(f"Dynamic backtest symbols: {symbols}")
-        return list(symbols)
-
-    # --- バックテスト実行（省略: 前バージョンと同じ） ---
-    def run_backtest_for_symbol(self, symbol):
-        # （ここは前回のコードと同じ処理）
-        ...
+    def summary(self):
+        df = pd.DataFrame(self.trades)
+        if df.empty:
+            return {"win_rate": 0, "trades": 0, "final_balance": self.balance}
+        win_rate = (df['outcome'] == "WIN").mean() * 100
+        return {
+            "win_rate": round(win_rate, 2),
+            "trades": len(df),
+            "final_balance": round(self.balance, 2)
+        }
