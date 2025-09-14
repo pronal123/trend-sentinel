@@ -35,17 +35,21 @@ regime_detector = MarketRegimeDetector()
 # --- 4. Webサーバー (Renderのヘルスチェック & 管理/ステータスページ) ---
 app = Flask(__name__)
 
+# --- ▼▼▼ HTMLテンプレートを更新 ▼▼▼ ---
 STATUS_PAGE_HTML = """
 <!DOCTYPE html>
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bot Position Status</title>
+    <title>Bot Status</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; color: #333; padding: 2rem; }
         .container { max-width: 800px; margin: auto; background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-        h1 { text-align: center; color: #1a1a1a; }
+        h1, h2 { text-align: center; color: #1a1a1a; }
+        .balance { text-align: center; margin: 2rem 0; }
+        .balance-label { font-size: 1.2rem; color: #555; }
+        .balance-value { font-size: 2.5rem; font-weight: bold; color: #1a1a1a; margin-top: 0.5rem; }
         table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; }
         th, td { padding: 0.8rem; text-align: left; border-bottom: 1px solid #ddd; }
         th { background-color: #f7f7f7; }
@@ -56,7 +60,14 @@ STATUS_PAGE_HTML = """
 </head>
 <body>
     <div class="container">
-        <h1>🤖 Bot Position Status</h1>
+        <h1>🤖 Bot Status</h1>
+        
+        <div class="balance">
+            <div class="balance-label">現在の総資産残高</div>
+            <div class="balance-value">${{ "%.2f"|format(total_balance) }}</div>
+        </div>
+
+        <h2>アクティブなポジション</h2>
         {% if positions %}
             <table>
                 <thead>
@@ -87,11 +98,8 @@ STATUS_PAGE_HTML = """
 """
 
 ADMIN_PAGE_HTML = """
-<!DOCTYPE html>
-<html lang="ja">
-<head><title>Bot Admin Panel</title><style>body{font-family:sans-serif;background:#f0f2f5;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.container{background:white;padding:2rem;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.1);text-align:center}h1{color:#333}input{padding:.5rem;width:80%;margin-bottom:1rem;border:1px solid #ccc;border-radius:4px}button{padding:.7rem 1.5rem;border:none;background-color:#007bff;color:white;border-radius:4px;cursor:pointer;font-size:1rem}button:hover{background-color:#0056b3}#response{margin-top:1rem;font-weight:700}</style></head>
-<body>
-<div class="container"><h1>🤖 Bot Admin Panel</h1><div><input type="password" id="secretKey" placeholder="Enter Train Secret Key"></div><div><button onclick="triggerRetrain()">Retrain AI Model</button></div><p id="response"></p></div>
+<!DOCTYPE html><html lang="ja"><head><title>Bot Admin Panel</title><style>body{font-family:sans-serif;background:#f0f2f5;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.container{background:white;padding:2rem;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.1);text-align:center}h1{color:#333}input{padding:.5rem;width:80%;margin-bottom:1rem;border:1px solid #ccc;border-radius:4px}button{padding:.7rem 1.5rem;border:none;background-color:#007bff;color:white;border-radius:4px;cursor:pointer;font-size:1rem}button:hover{background-color:#0056b3}#response{margin-top:1rem;font-weight:700}</style></head>
+<body><div class="container"><h1>🤖 Bot Admin Panel</h1><div><input type="password" id="secretKey" placeholder="Enter Train Secret Key"></div><div><button onclick="triggerRetrain()">Retrain AI Model</button></div><p id="response"></p></div>
 <script>async function triggerRetrain(){const e=document.getElementById("secretKey").value,t=document.getElementById("response");t.textContent="Sending request...";try{const n=await fetch("/retrain",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({secret_key:e})}),o=await n.json();n.ok?(t.style.color="green",t.textContent=`Success: ${o.message}`):(t.style.color="red",t.textContent=`Error: ${o.error||"Unknown error"}`)}catch(e){t.style.color="red",t.textContent=`Network Error: ${e}`}}</script>
 </body></html>
 """
@@ -104,8 +112,15 @@ def health_check():
 def admin_panel():
     return ADMIN_PAGE_HTML
 
+# --- ▼▼▼ この関数を更新 ▼▼▼ ---
 @app.route('/status')
 def position_status_page():
+    """現在のポジション状況と総資産残高をHTMLページとして表示する"""
+    
+    # 1. 取引所から最新の総資産残高を取得
+    total_balance = trader.get_account_balance_usd() or 0.0
+    
+    # 2. 現在のポジション情報を取得・整形
     active_positions_details = state.get_all_positions()
     enriched_positions = []
     if active_positions_details:
@@ -117,7 +132,9 @@ def position_status_page():
                 details['pnl'] = (current_price - details['entry_price']) * position_size
                 details['pnl_percent'] = (current_price / details['entry_price'] - 1) * 100
                 enriched_positions.append(details)
-    return render_template_string(STATUS_PAGE_HTML, positions=enriched_positions)
+
+    # 3. HTMLテンプレートに残高とポジション情報を渡してページを生成
+    return render_template_string(STATUS_PAGE_HTML, positions=enriched_positions, total_balance=total_balance)
 
 @app.route('/retrain', methods=['POST'])
 def retrain_model():
@@ -156,12 +173,20 @@ def run_hourly_status_update():
         price = data_agg.get_latest_price(token_id)
         if price: enriched_positions.append({**details, 'current_price': price})
     notifier.send_position_status_update(enriched_positions)
+    
+def run_daily_balance_update():
+    """1日1回、残高をTelegramに通知する"""
+    logging.info("--- ☀️ Daily Balance Update ---")
+    total_balance = trader.get_account_balance_usd()
+    notifier.send_balance_update(total_balance)
 
 # --- 6. スケジューラの定義と実行 ---
 def run_scheduler():
     logging.info("Scheduler started.")
+    jst = pytz.timezone('Asia/Tokyo')
     schedule.every(15).minutes.do(run_trading_cycle)
     schedule.every(1).hour.do(run_hourly_status_update)
+    schedule.every().day.at("09:00", jst).do(run_daily_balance_update)
     while True:
         schedule.run_pending()
         time.sleep(1)
