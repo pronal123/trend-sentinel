@@ -28,10 +28,10 @@ app = Flask(__name__)
 # ---------------------------------------------------
 # 初期化
 # ---------------------------------------------------
-state_manager = StateManager()
+state = StateManager()   # ✅ グローバルでエクスポートされる
 data_aggregator = DataAggregator()
 analyzer = AnalysisEngine()
-executor = TradingExecutor(state_manager)   # ✅ 修正
+executor = TradingExecutor(state)
 
 # ---------------------------------------------------
 # モデル読み込み（仮実装: 後で差し替え可）
@@ -47,7 +47,7 @@ model = load_model()
 # ---------------------------------------------------
 async def run_trading_cycle_async():
     logging.info("--- 🚀 Starting New Intelligent Trading Cycle ---")
-    win_rate = state_manager.get_win_rate()
+    win_rate = state.get_win_rate()
     logging.info(f"Current Bot Win Rate: {win_rate:.2f}%")
 
     # 市場データ取得
@@ -87,7 +87,7 @@ async def run_trading_cycle_async():
     logging.info(f"Summary: {summary}")
 
     # 状態保存
-    state_manager.save_state()
+    state.save_state()
 
 # ---------------------------------------------------
 # スケジューラ設定
