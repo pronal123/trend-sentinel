@@ -6,7 +6,7 @@ import logging
 import asyncio
 import atexit
 from flask import Flask
-import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 
 # --- 1. モジュールと設定をインポート ---
 import config
@@ -29,7 +29,7 @@ notifier = TelegramNotifier()
 app = Flask(__name__)
 
 # --- 3. 永続化とWebサーバー機能 ---
-@app.before_request
+@app.before_first_request
 def before_first_request():
     if not hasattr(app, 'is_initialized'):
         state.load_state_from_disk()
@@ -39,9 +39,15 @@ atexit.register(state.save_state_to_disk)
 
 @app.route('/')
 def health_check():
-    # ... (Webサーバー関連のコードは変更なし) ...
+    """
+    RenderのヘルスチェックやUptimeRobotからのアクセスに応答する。
+    この関数の下に、正しくインデントされたコードが必要です。
+    """
+    bot_status = 'ACTIVE' if config.IS_BOT_ACTIVE else 'INACTIVE'
+    position_count = len(state.get_all_active_positions())
+    return f"✅ Auto Trading Bot is {bot_status}. Active Positions: {position_count}"
 
-# --- 4. 非同期対応の分析・取引ロジック (大幅改良) ---
+# --- 4. 非同期対応の分析・取引ロジック ---
 async def analyze_candidate_async(candidate, signal_type, fng_data, time_frame):
     """非同期で単一の候補を分析するコルーチン（動的タイムフレーム対応）"""
     yf_ticker = f"{candidate['symbol'].upper()}-USD"
@@ -85,15 +91,14 @@ async def run_trading_cycle_async():
         logging.error("Could not fetch BTC data for market context. Aborting cycle.")
         return
     
-    # ATR（ボラティリティ）を計算し、分析タイムフレームを動的に決定
     btc_series_daily.ta.atr(append=True)
     volatility = btc_series_daily['ATRp_14'].iloc[-1]
-    if volatility > 4.0: # ボラティリティが高い場合
+    if volatility > 4.0:
         time_frame = {'period': '7d', 'interval': '1h'}
-        logging.info(f"High volatility detected (BTC ATRp: {volatility:.2f}%). Using SHORT-TERM (1h) analysis.")
-    else: # 通常時
+        logging.info(f"High volatility detected. Using SHORT-TERM (1h) analysis.")
+    else:
         time_frame = {'period': '60d', 'interval': '4h'}
-        logging.info(f"Low volatility detected (BTC ATRp: {volatility:.2f}%). Using MID-TERM (4h) analysis.")
+        logging.info(f"Low volatility detected. Using MID-TERM (4h) analysis.")
 
     # フェーズ4: 分析候補のリストアップ
     all_data = data_agg.get_all_chains_data()
@@ -101,12 +106,10 @@ async def run_trading_cycle_async():
     safe_data = risk_filter.filter_risky_tokens(all_data)
     long_df, short_df, _, _ = analyzer.run_analysis(safe_data)
     
-    # 重複を排除した効率的な候補リストを作成
     candidates_map = {}
     def add_candidate(token, signal_type):
         candidates_map.setdefault(token['id'], {'token': token, 'signals': set()})['signals'].add(signal_type)
 
-    # ウォッチリスト、新規候補の順でリストを構築
     watchlist_ids = state.get_watchlist().keys()
     for _, token in safe_data[safe_data['id'].isin(watchlist_ids)].iterrows():
         add_candidate(token, 'LONG' if token['price_change_24h'] > 0 else 'SHORT')
@@ -114,11 +117,7 @@ async def run_trading_cycle_async():
     for _, token in short_df.head(config.CANDIDATE_POOL_SIZE).iterrows(): add_candidate(token, 'SHORT')
 
     # フェーズ5: 非同期での並列分析
-    tasks = []
-    for data in candidates_map.values():
-        for signal_type in data['signals']:
-            tasks.append(analyze_candidate_async(data['token'], signal_type, fng_data, time_frame))
-
+    tasks = [analyze_candidate_async(data['token'], stype, fng_data, time_frame) for data in candidates_map.values() for stype in data['signals']]
     if tasks:
         logging.info(f"Analyzing {len(tasks)} potential signals concurrently...")
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -126,17 +125,15 @@ async def run_trading_cycle_async():
         valid_results = [r for r in results if r is not None and not isinstance(r, Exception)]
         if valid_results:
             best_trade_candidate = max(valid_results, key=lambda x: x['score'])
-            # フェーズ6: 取引実行
             trade = best_trade_candidate
             logging.info(f"HIGH-CONFIDENCE SIGNAL found: {trade['token']['symbol'].upper()} ({trade['type']}), Score: {trade['score']:.1f}")
-            # 勝率に応じて取引サイズを調整
+            
             adjusted_max_size = config.MAX_POSITION_SIZE_USD * (win_rate / 100) if win_rate > 50 else config.BASE_POSITION_SIZE_USD
             position_size = trader.calculate_position_size(config.BASE_POSITION_SIZE_USD, adjusted_max_size, trade['score'])
             
             trader.open_position(
                 trade['type'], trade['token']['id'], trade['series'], trade['score'],
-                notifier=notifier, analysis_comment=trade['analysis'],
-                position_size_usd=position_size
+                notifier=notifier, analysis_comment=trade['analysis'], position_size_usd=position_size
             )
         else:
             logging.info("No high-confidence trading opportunities found.")
@@ -145,27 +142,17 @@ async def run_trading_cycle_async():
 
 # --- 5. スケジューラとプログラム起動 ---
 def run_scheduler():
-    """スケジュールを管理し、非同期タスクを呼び出す"""
     logging.info("Scheduler started.")
-    
-    # 6時間ごとに取引サイクルを実行するタスク
     async def periodic_task():
         while True:
             await run_trading_cycle_async()
             state.save_state_to_disk()
             await asyncio.sleep(6 * 3600)
-
-    # メインの非同期ループを開始
     asyncio.run(periodic_task())
 
 if __name__ == "__main__":
     logging.info("Initializing Bot...")
-    # 状態を起動時に復元
     state.load_state_from_disk()
-    # BOTのメインロジックをバックグラウンドスレッドで実行
     threading.Thread(target=run_scheduler, daemon=True).start()
-    
-    # Webサーバーをメインスレッドで実行
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
-
