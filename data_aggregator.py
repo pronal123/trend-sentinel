@@ -13,7 +13,8 @@ class DataAggregator:
     @api_retry_decorator(retries=3, delay=5)
     def get_top_tokens(self, limit=50):
         logging.info(f"Fetching top {limit} tokens from CoinGecko...")
-        return self.cg.get_coins_markets(vs_currency='usd', per_page=limit, page=1)
+        tokens = self.cg.get_coins_markets(vs_currency='usd', per_page=limit, page=1)
+        return tokens if tokens else []
 
     @api_retry_decorator(retries=3, delay=5)
     def get_latest_price(self, token_id):
@@ -24,6 +25,8 @@ class DataAggregator:
     def get_historical_data(self, yf_ticker, period='1y'):
         logging.info(f"Fetching historical data for {yf_ticker}...")
         data = yf.download(yf_ticker, period=period, progress=False)
-        if data.empty: return data
+        if data.empty:
+            return data
+        # yfinanceから返される列名を整形してエラーを防ぐ
         data.columns = [col.lower().replace(' ', '_') for col in data.columns]
         return data
