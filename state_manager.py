@@ -1,120 +1,95 @@
 import json
 import os
-from datetime import datetime
-import pytz
-import logging
-
+import datetime
+import numpy as np
 
 class StateManager:
     def __init__(self, state_file="bot_state.json"):
         self.state_file = state_file
         self.state = {
-            "balance": 10000.0,   # 初期残高（仮想USD）
-            "positions": {},      # { "BTCUSDT": {"side": "LONG", "amount": 0.1, "entry": 27000} }
-            "trades": [],         # 取引履歴
-            "win_rate_history": [],  # 勝率履歴 [{time, win_rate}]
-            "snapshots": []       # 市場スナップショット履歴
+            "balance": 10000.0,  # 初期残高 USDT
+            "positions": {},
+            "win_history": [],
+            "trade_history": [],
+            "equity_curve": [],
         }
-        self._load()
+        self.load_state()
 
-    # ==============================
-    # 永続化
-    # ==============================
-    def _load(self):
+    def load_state(self):
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, "r") as f:
                     self.state = json.load(f)
-            except Exception as e:
-                logging.error(f"Failed to load state file: {e}")
+            except Exception:
+                pass
 
-    def _save(self):
-        try:
-            with open(self.state_file, "w") as f:
-                json.dump(self.state, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logging.error(f"Failed to save state file: {e}")
+    def save_state(self):
+        with open(self.state_file, "w") as f:
+            json.dump(self.state, f, indent=2)
 
-    # ==============================
-    # 残高管理
-    # ==============================
-    def update_balance(self, amount: float):
-        self.state["balance"] += amount
-        self._save()
-
-    def get_balance(self) -> float:
+    def get_balance(self):
         return self.state.get("balance", 0.0)
 
-    # ==============================
-    # 勝率管理
-    # ==============================
-    def record_trade_result(self, win: bool):
-        """取引の勝敗を記録し、勝率履歴を更新"""
-        self.state["trades"].append({
-            "time": datetime.now(pytz.timezone("Asia/Tokyo")).isoformat(),
-            "result": "WIN" if win else "LOSS"
-        })
+    def update_balance(self, delta):
+        self.state["balance"] += delta
+        self.state["equity_curve"].append(self.state["balance"])
+        self.save_state()
 
-        # 勝率計算
-        wins = sum(1 for t in self.state["trades"] if t["result"] == "WIN")
-        total = len(self.state["trades"])
-        win_rate = (wins / total * 100) if total > 0 else 0
-
-        self.state["win_rate_history"].append({
-            "time": datetime.now(pytz.timezone("Asia/Tokyo")).isoformat(),
-            "win_rate": win_rate
-        })
-        self._save()
-
-    def get_win_rate(self) -> float:
-        if not self.state["trades"]:
-            return 0.0
-        wins = sum(1 for t in self.state["trades"] if t["result"] == "WIN")
-        total = len(self.state["trades"])
-        return (wins / total * 100)
-
-    def get_win_rate_history(self):
-        return self.state.get("win_rate_history", [])
-
-    # ==============================
-    # ポジション管理
-    # ==============================
-    def open_position(self, symbol: str, side: str, amount: float, entry: float):
+    def open_position(self, symbol, side, size, price, market_type="spot"):
         self.state["positions"][symbol] = {
             "side": side,
-            "amount": amount,
-            "entry": entry,
-            "opened_at": datetime.now(pytz.timezone("Asia/Tokyo")).isoformat()
+            "size": size,
+            "entry_price": price,
+            "market_type": market_type,
+            "timestamp": datetime.datetime.now().isoformat()
         }
-        self._save()
+        self.save_state()
 
-    def close_position(self, symbol: str, exit_price: float):
-        pos = self.state["positions"].pop(symbol, None)
-        if pos:
-            pnl = (exit_price - pos["entry"]) * pos["amount"]
-            if pos["side"] == "SHORT":
-                pnl = -pnl
-            self.update_balance(pnl)
-            self.record_trade_result(win=(pnl > 0))
-        self._save()
+    def close_position(self, symbol, exit_price, pnl, win):
+        if symbol in self.state["positions"]:
+            del self.state["positions"][symbol]
 
-    def get_positions(self):
-        return self.state.get("positions", {})
+        self.update_balance(pnl)
+        self.record_trade_result(win, pnl)
 
-    # ==============================
-    # スナップショット保存
-    # ==============================
-    def save_snapshot(self, snapshot: dict):
-        self.state["snapshots"].append({
-            "time": datetime.now(pytz.timezone("Asia/Tokyo")).isoformat(),
-            "data": snapshot
-        })
-        # 古いデータを整理（例: 100件以上なら削除）
-        if len(self.state["snapshots"]) > 100:
-            self.state["snapshots"] = self.state["snapshots"][-100:]
-        self._save()
+    def record_trade_result(self, win, pnl):
+        self.state["win_history"].append(1 if win else 0)
+        self.state["trade_history"].append(pnl)
+        self.save_state()
 
-    def get_latest_snapshot(self):
-        if not self.state["snapshots"]:
-            return {}
-        return self.state["snapshots"][-1]
+    def get_win_rate(self):
+        if not self.state["win_history"]:
+            return 0.0
+        return sum(self.state["win_history"]) / len(self.state["win_history"]) * 100
+
+    def get_equity_curve(self):
+        return self.state.get("equity_curve", [])
+
+    def compute_metrics(self):
+        trades = self.state["trade_history"]
+        if not trades:
+            return {
+                "pnl": 0,
+                "max_drawdown": 0,
+                "sharpe_ratio": 0,
+                "profit_factor": 0
+            }
+
+        pnl = sum(trades)
+        equity = np.cumsum(trades)
+        dd = equity - np.maximum.accumulate(equity)
+        max_dd = dd.min() if len(dd) else 0
+
+        returns = np.array(trades)
+        sharpe = (returns.mean() / (returns.std() + 1e-6)) * np.sqrt(252) if len(returns) > 1 else 0
+
+        gains = sum([t for t in trades if t > 0])
+        losses = abs(sum([t for t in trades if t < 0]))
+        pf = (gains / losses) if losses > 0 else float("inf")
+
+        return {
+            "pnl": pnl,
+            "max_drawdown": float(max_dd),
+            "sharpe_ratio": float(sharpe),
+            "profit_factor": float(pf)
+        }
