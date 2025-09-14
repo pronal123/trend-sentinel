@@ -1,62 +1,40 @@
-# telegram_notifier.py
-import os, logging
-from datetime import datetime
-import pytz
-from telegram import Bot
-from telegram.error import TelegramError
+import requests
+import logging
+import datetime
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 class TelegramNotifier:
-    def __init__(self):
-        token = os.environ.get('TELEGRAM_BOT_TOKEN')
-        self.chat_id = os.environ.get('TELEGRAM_CHAT_ID')
-        self.bot = Bot(token=token) if token and self.chat_id else None
-        if not self.bot:
-            logging.warning("Telegram Bot not configured. Notifications are disabled.")
+    def __init__(self, token=TELEGRAM_BOT_TOKEN, chat_id=TELEGRAM_CHAT_ID):
+        self.token = token
+        self.chat_id = chat_id
+        self.base = f"https://api.telegram.org/bot{self.token}"
 
-    def _send_message(self, message):
-        if not self.bot: return
+    def send(self, text):
+        if not self.token or not self.chat_id:
+            logging.warning("Telegram config missing; skipping send")
+            return
         try:
-            self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode='Markdown')
-            return True
-        except TelegramError as e:
-            logging.error(f"Telegram Error: {e}")
-            return False
+            payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
+            resp = requests.post(f"{self.base}/sendMessage", data=payload, timeout=10)
+            if resp.status_code != 200:
+                logging.error(f"Telegram send failed: {resp.status_code} {resp.text}")
+        except Exception as e:
+            logging.error(f"Telegram send exception: {e}")
 
-    def send_new_position_notification(self, p_data):
-        profit_on_tp = (p_data['take_profit'] - p_data['entry_price']) * p_data['position_size']
-        loss_on_sl = (p_data['stop_loss'] - p_data['entry_price']) * p_data['position_size']
-        message = (
-            f"✅ *新規ポジション獲得通知*\n\n"
-            f"通貨: *{p_data['ticker']}*\n参入価格: *${p_data['entry_price']:,.4f}*\n\n"
-            f"--- 資金状況 ---\n総残高: *${p_data['current_balance']:,.2f}*\nポジションサイズ: *{p_data['position_size']:.6f} {p_data['asset']}* (${p_data['trade_amount_usd']:,.2f})\n\n"
-            f"--- 出口戦略 ---\n🟢 利確: *${p_data['take_profit']:,.4f}* (利益: *+${profit_on_tp:,.2f}*)\n🔴 損切: *${p_data['stop_loss']:,.4f}* (損失: *-${abs(loss_on_sl):,.2f}*)\n\n"
-            f"--- パフォーマンス ---\n現在の勝率: *{p_data['win_rate']:.2f}%*\n\n"
-            f"_{p_data['reason']}_"
-        )
-        if self._send_message(message):
-            logging.info(f"Sent new position notification for {p_data['ticker']}.")
+    def send_trade_summary(self, long_list, short_list, spikes, meta):
+        ts = datetime.datetime.now().astimezone().strftime("%Y/%m/%d %H:%M JST")
+        title = f"📡 トレンドセンチネル速報（{ts}）\n\n"
+        body = ""
+        def mk_list(items, label):
+            if not items: return f"— {label}: なし\n\n"
+            s = f"— {label}:\n"
+            for t in items[:10]:
+                s += f"{t['symbol']}  | 24h:{t['24h']:+.1f}%  1h:{t['1h']:+.1f}%  vol:{t['vol_pct']:+.0f}%\n  根拠: {t.get('reason','')}\n"
+            s += "\n"
+            return s
 
-    def send_position_status_update(self, active_positions):
-        jst = pytz.timezone('Asia/Tokyo')
-        now = datetime.now(jst).strftime('%Y/%m/%d %H:%M JST')
-        message = f"🕒 *ポジション状況 定時報告 ({now})*\n\n"
-        if not active_positions:
-            message += "現在、アクティブなポジションはありません。"
-        else:
-            # ... (前回と同様のメッセージ整形ロジック)
-            pass
-        self._send_message(message)
-
-    def send_close_position_notification(self, ticker, reason, result, pnl):
-        emoji = "🎉" if result == 'win' else "😥"
-        title = "利確" if reason == "TAKE PROFIT" else "損切"
-        message = f"{emoji} *ポジション決済通知*\n\n通貨: *{ticker}*\n決済理由: *{title}*\n確定損益: *${pnl:+.2f}*"
-        self._send_message(message)
-
-    def send_error_notification(self, error_message):
-        message = f"🚨 *BOTエラー通知*\n\n{error_message}"
-        self._send_message(message)
-
-    def send_daily_summary(self, win_rate, trade_history):
-        # ... (日次サマリーのメッセージ整形と送信)
-        pass
+        body += mk_list(long_list, "LONG候補 上位")
+        body += mk_list(short_list, "SHORT候補 上位")
+        body += mk_list(spikes, "急騰アラート")
+        body += f"市場概況: 監視銘柄数 {meta.get('total',0)} / LONG検出 {len(long_list)} / SHORT検出 {len(short_list)} / 急騰 {len(spikes)}\n"
+        self.send(title + body)
