@@ -1,35 +1,65 @@
 import yfinance as yf
 import pandas as pd
 import logging
+import requests
+import json
 from data_aggregator import DataAggregator
 
 
 class Backtester:
-    def __init__(self, symbols=None, interval="5m", period="30d"):
-        if symbols is None:
-            symbols = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD"]
-        self.symbols = symbols
+    def __init__(self, interval="5m", period="30d", state_file="bot_state.json"):
         self.interval = interval
         self.period = period
         self.aggregator = DataAggregator()
+        self.state_file = state_file
+
+    # --- 動的銘柄リスト生成 ---
+    def get_dynamic_symbols(self):
+        symbols = set()
+
+        # Coingecko トレンド銘柄
+        try:
+            url = "https://api.coingecko.com/api/v3/search/trending"
+            res = requests.get(url, timeout=10).json()
+            for item in res.get("coins", []):
+                symbol = item["item"]["symbol"].upper()
+                symbols.add(f"{symbol}-USD")
+        except Exception as e:
+            logging.error(f"Coingecko fetch error: {e}")
+
+        # 保有ポジション銘柄（state_manager 管理）
+        try:
+            with open(self.state_file, "r") as f:
+                state = json.load(f)
+                positions = state.get("positions", [])
+                for pos in positions:
+                    symbols.add(f"{pos['symbol']}-USD")
+        except Exception as e:
+            logging.warning(f"Could not load state file: {e}")
+
+        # デフォルトの主要銘柄を保険で追加
+        default = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD"]
+        symbols.update(default)
+
+        logging.info(f"Dynamic backtest symbols: {symbols}")
+        return list(symbols)
 
     def run_backtest_for_symbol(self, symbol):
-        logging.info(f"Starting backtest for {symbol} ({self.period}, {self.interval})")
+        logging.info(f"Backtesting {symbol} ({self.period}, {self.interval})")
 
-        df = yf.download(symbol, period=self.period, interval=self.interval)
+        df = yf.download(symbol, period=self.period, interval=self.interval, progress=False)
         if df.empty:
-            logging.error(f"No historical data fetched for {symbol}.")
+            logging.error(f"No historical data for {symbol}")
             return {}
 
         trades = []
-        balance = 10000.0  # 初期残高（USD）
+        balance = 10000.0
         position = None
 
         for i in range(2, len(df)):
             row = df.iloc[i]
             price = row["Close"]
 
-            # ポジション未保有ならシグナルをチェック
             if position is None:
                 change_1h = (df["Close"].iloc[i] / df["Close"].iloc[i-12] - 1) * 100 if i >= 12 else 0
                 change_24h = (df["Close"].iloc[i] / df["Close"].iloc[i-288] - 1) * 100 if i >= 288 else 0
@@ -37,7 +67,6 @@ class Backtester:
                 if change_24h > 5 and change_1h > 2:
                     tp, sl = self.aggregator.calc_takeprofit_stoploss(price, 0.1)
                     position = {"side": "long", "entry": price, "tp": tp, "sl": sl}
-
                 elif change_24h < -5 and change_1h < -2:
                     tp, sl = self.aggregator.calc_takeprofit_stoploss(price, -0.1)
                     position = {"side": "short", "entry": price, "tp": tp, "sl": sl}
@@ -83,9 +112,10 @@ class Backtester:
         return summary
 
     def run_all(self):
+        symbols = self.get_dynamic_symbols()
         results = []
-        for symbol in self.symbols:
-            res = self.run_backtest_for_symbol(symbol)
+        for sym in symbols:
+            res = self.run_backtest_for_symbol(sym)
             if res:
                 results.append(res)
 
