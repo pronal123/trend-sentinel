@@ -1,106 +1,120 @@
-# state_manager.py
 import json
 import os
-from datetime import datetime, timezone
-import threading
+from datetime import datetime
+import pytz
 import logging
 
-LOCK = threading.Lock()
 
 class StateManager:
     def __init__(self, state_file="bot_state.json"):
         self.state_file = state_file
         self.state = {
-            "positions": {},
-            "trade_history": [],
-            "ai_comments_cache": {},   # 銘柄ごとのキャッシュ（将来活用可能）
-            "chain_perf_cache": {"data": {}, "timestamp": 0}
+            "balance": 10000.0,   # 初期残高（仮想USD）
+            "positions": {},      # { "BTCUSDT": {"side": "LONG", "amount": 0.1, "entry": 27000} }
+            "trades": [],         # 取引履歴
+            "win_rate_history": [],  # 勝率履歴 [{time, win_rate}]
+            "snapshots": []       # 市場スナップショット履歴
         }
-        self._load_state()
+        self._load()
 
-    # ------------------------
+    # ==============================
     # 永続化
-    # ------------------------
-    def _load_state(self):
-        try:
-            if os.path.exists(self.state_file):
-                with open(self.state_file, "r", encoding="utf-8") as f:
+    # ==============================
+    def _load(self):
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, "r") as f:
                     self.state = json.load(f)
-                logging.info(f"Loaded state from {self.state_file}")
-            else:
-                logging.info(f"State file {self.state_file} not found. Using fresh state.")
-        except Exception as e:
-            logging.error(f"Failed to load state: {e}")
+            except Exception as e:
+                logging.error(f"Failed to load state file: {e}")
 
-    def save_state(self):
+    def _save(self):
         try:
-            with LOCK:
-                with open(self.state_file, "w", encoding="utf-8") as f:
-                    json.dump(self.state, f, ensure_ascii=False, indent=2)
-            logging.info(f"Saved state to {self.state_file}")
+            with open(self.state_file, "w") as f:
+                json.dump(self.state, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            logging.error(f"Failed to save state: {e}")
+            logging.error(f"Failed to save state file: {e}")
 
-    # ------------------------
-    # ポジション管理
-    # ------------------------
-    def set_position(self, token_id: str, active: bool, details: dict):
-        if active:
-            self.state.setdefault("positions", {})[token_id] = details
-        else:
-            self.state.setdefault("positions", {}).pop(token_id, None)
-        self.save_state()
+    # ==============================
+    # 残高管理
+    # ==============================
+    def update_balance(self, amount: float):
+        self.state["balance"] += amount
+        self._save()
 
-    def get_all_active_positions(self) -> dict:
-        return self.state.get("positions", {})
+    def get_balance(self) -> float:
+        return self.state.get("balance", 0.0)
 
-    def has_position(self, token_id: str) -> bool:
-        return token_id in self.state.get("positions", {})
-
-    def get_position_details(self, token_id: str):
-        return self.state.get("positions", {}).get(token_id)
-
-    # ------------------------
-    # トレード履歴 / 勝率
-    # ------------------------
-    def record_trade_result(self, token_id: str, result: str):
-        # result: 'win' or 'loss'
-        self.state.setdefault("trade_history", []).append({
-            "token": token_id,
-            "result": result,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+    # ==============================
+    # 勝率管理
+    # ==============================
+    def record_trade_result(self, win: bool):
+        """取引の勝敗を記録し、勝率履歴を更新"""
+        self.state["trades"].append({
+            "time": datetime.now(pytz.timezone("Asia/Tokyo")).isoformat(),
+            "result": "WIN" if win else "LOSS"
         })
-        self.save_state()
+
+        # 勝率計算
+        wins = sum(1 for t in self.state["trades"] if t["result"] == "WIN")
+        total = len(self.state["trades"])
+        win_rate = (wins / total * 100) if total > 0 else 0
+
+        self.state["win_rate_history"].append({
+            "time": datetime.now(pytz.timezone("Asia/Tokyo")).isoformat(),
+            "win_rate": win_rate
+        })
+        self._save()
 
     def get_win_rate(self) -> float:
-        history = self.state.get("trade_history", [])
-        if not history:
+        if not self.state["trades"]:
             return 0.0
-        wins = sum(1 for h in history if h.get("result") == "win")
-        return (wins / len(history)) * 100.0
+        wins = sum(1 for t in self.state["trades"] if t["result"] == "WIN")
+        total = len(self.state["trades"])
+        return (wins / total * 100)
 
-    # ------------------------
-    # AIコメントキャッシュ（銘柄ごと）
-    # ------------------------
-    def update_ai_comment(self, symbol: str, comment: str):
-        self.state.setdefault("ai_comments_cache", {})[symbol] = {
-            "comment": comment,
-            "last_update": datetime.now(timezone.utc).isoformat()
+    def get_win_rate_history(self):
+        return self.state.get("win_rate_history", [])
+
+    # ==============================
+    # ポジション管理
+    # ==============================
+    def open_position(self, symbol: str, side: str, amount: float, entry: float):
+        self.state["positions"][symbol] = {
+            "side": side,
+            "amount": amount,
+            "entry": entry,
+            "opened_at": datetime.now(pytz.timezone("Asia/Tokyo")).isoformat()
         }
-        self.save_state()
+        self._save()
 
-    def get_ai_comment(self, symbol: str):
-        return self.state.get("ai_comments_cache", {}).get(symbol)
+    def close_position(self, symbol: str, exit_price: float):
+        pos = self.state["positions"].pop(symbol, None)
+        if pos:
+            pnl = (exit_price - pos["entry"]) * pos["amount"]
+            if pos["side"] == "SHORT":
+                pnl = -pnl
+            self.update_balance(pnl)
+            self.record_trade_result(win=(pnl > 0))
+        self._save()
 
-    def get_all_ai_comments(self):
-        return self.state.get("ai_comments_cache", {})
+    def get_positions(self):
+        return self.state.get("positions", {})
 
-    # ------------------------
-    # チェーンパフォーマンスキャッシュ（5分キャッシュ用）
-    # ------------------------
-    def get_chain_perf_cache(self):
-        return self.state.get("chain_perf_cache", {"data": {}, "timestamp": 0})
+    # ==============================
+    # スナップショット保存
+    # ==============================
+    def save_snapshot(self, snapshot: dict):
+        self.state["snapshots"].append({
+            "time": datetime.now(pytz.timezone("Asia/Tokyo")).isoformat(),
+            "data": snapshot
+        })
+        # 古いデータを整理（例: 100件以上なら削除）
+        if len(self.state["snapshots"]) > 100:
+            self.state["snapshots"] = self.state["snapshots"][-100:]
+        self._save()
 
-    def update_chain_perf_cache(self, data: dict, timestamp: float):
-        self.state["chain_perf_cache"] = {"data": data, "timestamp": timestamp}
-        self.save_state()
+    def get_latest_snapshot(self):
+        if not self.state["snapshots"]:
+            return {}
+        return self.state["snapshots"][-1]
