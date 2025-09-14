@@ -5,7 +5,7 @@ import time
 import logging
 import asyncio
 import atexit
-from flask import Flask
+from flask import Flask, render_template_string
 import pandas as pd
 
 # --- 1. モジュールと設定をインポート ---
@@ -39,13 +39,131 @@ def health_check():
     position_count = len(state.get_all_active_positions())
     return f"✅ Auto Trading Bot is {bot_status}. Active Positions: {position_count}"
 
+STATUS_PAGE_HTML = """
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="60">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bot Status Dashboard</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f4f6f9; color: #333; padding: 2rem; }
+        .container { max-width: 960px; margin: auto; }
+        h1, h2 { text-align: center; color: #1a1a1a; }
+        h2 { margin-top: 2.5rem; border-bottom: 2px solid #eee; padding-bottom: 0.5rem; }
+        .grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1.5rem; text-align: center; margin: 2rem 0; }
+        .grid-item { background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+        .grid-item .label { font-size: 1.1rem; color: #555; }
+        .grid-item .value { font-size: 2rem; font-weight: bold; color: #1a1a1a; margin-top: 0.5rem; }
+        .analysis-box { margin-top: 2rem; padding: 1.5rem; background: white; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+        .analysis-box h2 { text-align: left; margin-top: 0; }
+        .analysis-box pre { white-space: pre-wrap; word-wrap: break-word; font-family: 'SF Mono', 'Menlo', 'Monaco', monospace; font-size: .9rem; line-height: 1.7; color: #444; background: #f9f9f9; padding: 1rem; border-radius: 4px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; background: white; box-shadow: 0 4px 12px rgba(0,0,0,0.08); border-radius: 8px; overflow: hidden; }
+        th, td { padding: 1rem; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #f7f7f9; }
+        .profit { color: #28a745; }
+        .loss { color: #dc3545; }
+        .no-positions { text-align: center; padding: 2rem; color: #888; background: white; border-radius: 8px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 Bot Status Dashboard</h1>
+        <div class="grid-container">
+            <div class="grid-item">
+                <div class="label">現在の総資産残高</div>
+                <div class="value">${{ "%.2f"|format(total_balance) }}</div>
+            </div>
+            <div class="grid-item">
+                <div class="label">市場センチメント</div>
+                <div class="value">{{ fng_sentiment }} ({{ fng_value }})</div>
+            </div>
+            <div class="grid-item">
+                <div class="label">市場レジーム</div>
+                <div class="value">{{ market_regime }}</div>
+            </div>
+        </div>
+        
+        <div class="analysis-box">
+            <h2>市場分析コメント (BTC-USD)</h2>
+            <pre>{{ analysis_comments }}</pre>
+        </div>
+        
+        <h2>アクティブなポジション</h2>
+        {% if positions %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Ticker</th><th>Side</th><th>Entry / Current</th><th>Unrealized P/L</th><th>Take Profit</th><th>Stop Loss</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for pos in positions %}
+                        <tr class="{{ 'profit' if pos.pnl >= 0 else 'loss' }}">
+                            <td><strong>{{ pos.ticker }}</strong></td>
+                            <td>{{ pos.side.upper() }}</td>
+                            <td>${{ "%.4f"|format(pos.entry_price) }}<br>→ ${{ "%.4f"|format(pos.current_price) }}</td>
+                            <td><strong>{{ "%.2f"|format(pos.pnl_percent) }}%</strong> (${{ "%.2f"|format(pos.pnl) }})</td>
+                            <td class="profit">${{ "%.4f"|format(pos.take_profit) }}</td>
+                            <td class="loss">${{ "%.4f"|format(pos.stop_loss) }}</td>
+                        </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <p class="no-positions">現在、アクティブなポジションはありません。</p>
+        {% endif %}
+    </div>
+</body>
+</html>
+"""
+
+@app.route('/status')
+def status_dashboard():
+    total_balance = trader.get_account_balance_usd()
+    fng_value, fng_sentiment = data_agg.get_fear_and_greed_index()
+    
+    btc_series = data_agg.fetch_ohlcv(config.MARKET_CONTEXT_TICKER, '90d', '1d')
+    market_regime, analysis_comments = "N/A", "BTCデータの取得に失敗しました。"
+    if not btc_series.empty:
+        _, analysis_comments, market_regime = scorer.generate_score_and_analysis(
+            {'symbol': 'BTC', 'id': 'bitcoin'}, btc_series, {'value': fng_value, 'sentiment': fng_sentiment}, 'LONG'
+        )
+
+    active_positions = state.get_all_active_positions()
+    enriched_positions = []
+    for token_id, details in active_positions.items():
+        price = data_agg.get_latest_price(token_id)
+        if price:
+            details['current_price'] = price
+            size = details.get('position_size', 0)
+            if details['side'] == 'long':
+                pnl = (price - details['entry_price']) * size
+                pnl_percent = (price / details['entry_price'] - 1) * 100 if details['entry_price'] else 0
+            else: # short
+                pnl = (details['entry_price'] - price) * size
+                pnl_percent = (details['entry_price'] / price - 1) * 100 if price else 0
+            details['pnl'] = pnl
+            details['pnl_percent'] = pnl_percent
+            enriched_positions.append(details)
+            
+    return render_template_string(
+        STATUS_PAGE_HTML, 
+        positions=enriched_positions, 
+        total_balance=total_balance,
+        market_regime=market_regime,
+        fng_value=fng_value,
+        fng_sentiment=fng_sentiment,
+        analysis_comments=analysis_comments
+    )
+
 # --- 4. 非同期対応の分析・取引ロジック ---
 async def analyze_candidate_async(candidate, signal_type, fng_data, time_frame):
     """非同期で単一の候補を分析するコルーチン（動的タイムフレーム対応）"""
     yf_ticker = f"{candidate['symbol'].upper()}-USD"
     
     loop = asyncio.get_event_loop()
-    # yfinanceの同期的な呼び出しを、非同期コードをブロックしないようにスレッドプールで実行
     series = await loop.run_in_executor(None, data_agg.fetch_ohlcv, yf_ticker, time_frame['period'], time_frame['interval'])
     if series.empty:
         return None
@@ -56,7 +174,6 @@ async def analyze_candidate_async(candidate, signal_type, fng_data, time_frame):
     if score >= entry_threshold:
         return {'type': signal_type, 'token': candidate, 'series': series, 'score': score, 'analysis': analysis}
     elif score >= entry_threshold * 0.7:
-        # スコアが閾値に近ければ、次の機会のためにウォッチリストに追加
         state.update_watchlist(candidate['id'], score)
     
     return None
@@ -69,18 +186,15 @@ async def run_trading_cycle_async():
         
     logging.info("--- 🚀 Starting New Intelligent Trading Cycle ---")
 
-    # フェーズ1: 既存ポジションの監視とBOTの自己評価
     trader.check_active_positions(data_agg, notifier=notifier)
     win_rate = state.get_win_rate()
     logging.info(f"Current Bot Win Rate: {win_rate:.2f}%")
 
-    # フェーズ2: ポートフォリオのリスク管理
     if len(state.get_all_active_positions()) >= config.MAX_OPEN_POSITIONS:
-        logging.warning(f"Max positions ({config.MAX_OPEN_POSITIONS}) reached. Skipping new signal generation.")
+        logging.warning(f"Max positions reached. Skipping new signal generation.")
         return
 
-    # フェーズ3: 市場状況把握と分析戦略の決定
-    fng_data, _ = data_agg.get_fear_and_greed_index()
+    fng_data, fng_sentiment = data_agg.get_fear_and_greed_index()
     btc_series_daily = data_agg.fetch_ohlcv(config.MARKET_CONTEXT_TICKER, '90d', '1d')
     if btc_series_daily.empty:
         logging.error("Could not fetch BTC data for market context. Aborting cycle.")
@@ -88,14 +202,9 @@ async def run_trading_cycle_async():
     
     btc_series_daily.ta.atr(append=True)
     volatility = btc_series_daily['ATRp_14'].iloc[-1]
-    if volatility > 4.0:
-        time_frame = {'period': '7d', 'interval': '1h'}
-        logging.info(f"High volatility detected (BTC ATRp: {volatility:.2f}%). Using SHORT-TERM (1h) analysis.")
-    else:
-        time_frame = {'period': '60d', 'interval': '4h'}
-        logging.info(f"Low volatility detected (BTC ATRp: {volatility:.2f}%). Using MID-TERM (4h) analysis.")
+    time_frame = {'period': '7d', 'interval': '1h'} if volatility > 4.0 else {'period': '60d', 'interval': '4h'}
+    logging.info(f"Volatility detected (BTC ATRp: {volatility:.2f}%). Using {'SHORT' if volatility > 4.0 else 'MID'}-TERM analysis.")
 
-    # フェーズ4: 分析候補のリストアップ
     all_data = data_agg.get_all_chains_data()
     if all_data.empty: return
     safe_data = risk_filter.filter_risky_tokens(all_data)
@@ -107,12 +216,11 @@ async def run_trading_cycle_async():
 
     watchlist_ids = state.get_watchlist().keys()
     for _, token in safe_data[safe_data['id'].isin(watchlist_ids)].iterrows():
-        add_candidate(token, 'LONG' if token['price_change_24h'] > 0 else 'SHORT')
-    for _, token in long_df.head(config.CANDIDATE_POOL_SIZE).iterrows(): add_candidate(token, 'LONG')
-    for _, token in short_df.head(config.CANDIDATE_POOL_SIZE).iterrows(): add_candidate(token, 'SHORT')
+        add_candidate(token.to_dict(), 'LONG' if token['price_change_24h'] > 0 else 'SHORT')
+    for _, token in long_df.head(config.CANDIDATE_POOL_SIZE).iterrows(): add_candidate(token.to_dict(), 'LONG')
+    for _, token in short_df.head(config.CANDIDATE_POOL_SIZE).iterrows(): add_candidate(token.to_dict(), 'SHORT')
 
-    # フェーズ5: 非同期での並列分析
-    tasks = [analyze_candidate_async(data['token'], stype, fng_data, time_frame) for data in candidates_map.values() for stype in data['signals']]
+    tasks = [analyze_candidate_async(data['token'], stype, {'value': fng_data, 'sentiment': fng_sentiment}, time_frame) for data in candidates_map.values() for stype in data['signals']]
     if tasks:
         logging.info(f"Analyzing {len(tasks)} potential signals concurrently...")
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -123,9 +231,8 @@ async def run_trading_cycle_async():
             trade = best_trade_candidate
             logging.info(f"HIGH-CONFIDENCE SIGNAL found: {trade['token']['symbol'].upper()} ({trade['type']}), Score: {trade['score']:.1f}")
             
-            # 勝率に応じて最大取引額を調整
             adjusted_max_size = config.MAX_POSITION_SIZE_USD * (win_rate / 100) if win_rate > 50 else config.BASE_POSITION_SIZE_USD
-            position_size = trader.calculate_position_size(config.BASE_POSITION_SIZE_USD, adjusted_max_size, trade['score'])
+            position_size = trader.calculate_position_size(trade['score'], base_size_usd=config.BASE_POSITION_SIZE_USD, max_size_usd=adjusted_max_size)
             
             trader.open_position(
                 trade['type'], trade['token']['id'], trade['series'], trade['score'],
@@ -138,28 +245,19 @@ async def run_trading_cycle_async():
 
 # --- 5. スケジューラとプログラム起動 ---
 def run_scheduler():
-    """スケジュールを管理し、非同期タスクを呼び出す"""
     logging.info("Scheduler started.")
     
     async def periodic_task():
-        # 6時間ごとに取引サイクルを実行するタスク
-        # TODO: config.pyのスケジュール設定を読み込むように改良
         while True:
             await run_trading_cycle_async()
-            state.save_state_to_disk() # サイクルごとに状態を保存
-            await asyncio.sleep(6 * 3600) # 6時間待機
+            state.save_state_to_disk()
+            await asyncio.sleep(6 * 3600)
 
-    # メインの非同期ループを開始
     asyncio.run(periodic_task())
 
 if __name__ == "__main__":
     logging.info("Initializing Bot...")
-    # BOTのメインロジックを開始する前に、状態をファイルから読み込む
     state.load_state_from_disk()
-    
-    # BOTのメインロジック(スケジューラ)をバックグラウンドスレッドで実行
     threading.Thread(target=run_scheduler, daemon=True).start()
-    
-    # Webサーバーをメインスレッドで実行
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
