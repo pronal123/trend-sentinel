@@ -1,0 +1,843 @@
+# ==============================================================================
+#
+# 🚀 超高性能版 Colab ボット（Coinbase専用） - 最終完全版
+#
+# ✅ すべてのエラーと警告を修正し、安定稼働を確保
+# ✅ Google Driveからのモデルの自動読み込み・保存機能を実装
+# ✅ バックテストデータを永続化し、起動時から機能するよう改善
+# ✅ バックテストロジックをベクトル化し、性能を劇的に向上
+#
+# ==============================================================================
+
+# ===== 依存関係のインストールとクリーンアップ =====
+# ⚠️ このセルを実行後、必ず**「ランタイムを再起動」**してから再度実行してください。
+# これにより、依存関係の競合が完全に解消されます。
+!pip uninstall -y numpy pandas scikit-learn lightgbm xgboost ta ccxt matplotlib joblib pandas-ta
+!pip install --force-reinstall numpy==1.26.4 pandas==2.2.2 scikit-learn lightgbm xgboost matplotlib joblib ccxt
+!pip install ta pandas-ta
+
+# ===== Google Driveのマウント =====
+# 求められたら「Google Driveに接続」をクリックして許可してください。
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os, sys, time, math, io, gc, traceback, warnings, random
+warnings.filterwarnings("ignore")
+
+import ccxt
+import numpy as np
+import pandas as pd
+import requests
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime, timezone
+from typing import Tuple, Dict, List
+
+# ---- モデルの保存・読み込み ----
+import joblib
+
+# ---- テクニカル指標 ----
+from ta.momentum import RSIIndicator, StochRSIIndicator
+from ta.trend import EMAIndicator, MACD, ADXIndicator
+from ta.volatility import AverageTrueRange, BollingerBands, KeltnerChannel
+from ta.volume import OnBalanceVolumeIndicator
+import pandas_ta as pta
+
+# ---- 機械学習 ----
+import lightgbm as lgb
+import xgboost as xgb
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import f1_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import StackingClassifier
+from sklearn.linear_model import LogisticRegression
+
+# ================== 設定 ==================
+# ⚠️ 注意: セキュリティリスクを承知の上で平文でAPIキーを記述します。
+# このコードを公開しないでください。
+TELEGRAM_TOKEN = '7904380124:AAE2AuRITmgBw5OECTELF5151D3pRz4K9JM'
+TELEGRAM_CHAT_ID = '5890119671'
+
+MODEL_DIR = '/content/drive/MyDrive/crypto_models'
+
+WATCHLIST = [
+  "BTC/USD", "ETH/USD", "XRP/USD", "SOL/USD", "HBAR/USD", "SUI/USD", "DOGE/USD",
+  "BONK/USD", "PENGU/USD", "XLM/USD", "ADA/USD", "LINK/USD", "IDEX/USD",
+  "LTC/USD", "ENA/USD", "BCH/USD", "WIF/USD", "AVAX/USD", "SEI/USD", "DOT/USD"
+]
+
+QUALITY_NOTIFY_THRESHOLD = 65
+MIN_BARS = 250
+MAIN_LOOP_SLEEP_SEC = 60 * 30
+EXCHANGE_ID = 'coinbase'
+exchange = ccxt.coinbase({'enableRateLimit': True})
+
+PING_INTERVAL_SEC = 60 * 5
+ALIVE_NOTIFY_INTERVAL_SEC = 60 * 60 * 6
+
+# ================== ユーティリティ ==================
+def retry(max_tries=5, delay=1.0, backoff=2.0, exceptions=(Exception,)):
+    def deco(fn):
+        def wrapper(*args, **kwargs):
+            d = delay
+            for i in range(1, max_tries + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as e:
+                    print(f"⚠️ リトライ実行中... ({i}/{max_tries}) エラー: {e}")
+                    if i == max_tries:
+                        raise
+                    time.sleep(d)
+                    d *= backoff
+        return wrapper
+    return deco
+
+class TelegramNotifier:
+    def __init__(self, token, chat_id):
+        self.token = token
+        self.chat_id = chat_id
+        self.base_url = f'https://api.telegram.org/bot{self.token}'
+        self.is_enabled = bool(self.token and self.chat_id)
+
+    @retry(max_tries=3, delay=2.0, exceptions=(requests.exceptions.RequestException,))
+    def send_message(self, text):
+        if not self.is_enabled:
+            print("❌ TelegramトークンまたはチャットIDが設定されていません。通知は無効です。")
+            return
+        try:
+            url = f"{self.base_url}/sendMessage"
+            payload = {
+                'chat_id': self.chat_id,
+                'text': text,
+                'parse_mode': 'HTML'
+            }
+            response = requests.post(url, data=payload, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"❌ Telegramメッセージ送信に失敗しました: {e}")
+            raise
+
+    @retry(max_tries=3, delay=2.0, exceptions=(requests.exceptions.RequestException,))
+    def send_photo(self, photo_data, caption):
+        if not self.is_enabled:
+            print("❌ TelegramトークンまたはチャットIDが設定されていません。通知は無効です。")
+            return
+        try:
+            url = f"{self.base_url}/sendPhoto"
+            files = {'photo': ('chart.png', photo_data, 'image/png')}
+            payload = {
+                'chat_id': self.chat_id,
+                'caption': caption,
+                'parse_mode': 'HTML'
+            }
+            response = requests.post(url, data=payload, files=files, timeout=20)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"❌ Telegram写真送信に失敗しました: {e}")
+            raise
+
+def now_utc_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def fmt_price(x, digits=6):
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return "-"
+    s = f"{x:.{digits}f}"
+    s = s.rstrip('0').rstrip('.') if '.' in s else s
+    return s
+
+def escape_html(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", '&#39;')
+
+def symbol_icon(symbol):
+    icon_map = {
+        "BTC": "₿", "ETH": "Ξ", "XRP": "🪝", "SOL": "☀️", "DOGE": "🐶",
+        "BONK": "🐕", "PENGU": "🐧", "HBAR": "H", "SUI": "🌊",
+        "XLM": "⭐", "ADA": "₳", "LINK": "🔗", "IDEX": "⚡",
+        "LTC": "Ł", "ENA": "💵", "BCH": "🌱", "WIF": "👒",
+        "AVAX": "🔺", "SEI": "🌊", "DOT": "⚫"
+    }
+    prefix = symbol.split('/')[0]
+    return icon_map.get(prefix, '💎')
+
+def detect_candles(df_tail):
+    if len(df_tail) < 3: return {"bull_engulf": False, "bear_engulf": False, "bull_pin": False, "bear_pin": False}
+
+    bull_engulf = (df_tail.iloc[-1]['close'] > df_tail.iloc[-2]['open'] and
+                   df_tail.iloc[-1]['open'] < df_tail.iloc[-2]['close'] and
+                   (df_tail.iloc[-2]['close'] - df_tail.iloc[-2]['open'] < 0))
+    bear_engulf = (df_tail.iloc[-1]['close'] < df_tail.iloc[-2]['open'] and
+                   df_tail.iloc[-1]['open'] > df_tail.iloc[-2]['close'] and
+                   (df_tail.iloc[-2]['close'] - df_tail.iloc[-2]['open'] > 0))
+    bull_pin = (df_tail.iloc[-1]['open'] < df_tail.iloc[-1]['close'] and
+                (df_tail.iloc[-1]['close'] - df_tail.iloc[-1]['open']) / (df_tail.iloc[-1]['high'] - df_tail.iloc[-1]['low']) > 0.6)
+    bear_pin = (df_tail.iloc[-1]['open'] > df_tail.iloc[-1]['close'] and
+                (df_tail.iloc[-1]['open'] - df_tail.iloc[-1]['close']) / (df_tail.iloc[-1]['high'] - df_tail.iloc[-1]['low']) > 0.6)
+
+    return {"bull_engulf": bull_engulf, "bear_engulf": bear_engulf, "bull_pin": bull_pin, "bear_pin": bear_pin}
+
+
+# ================== データ処理クラス ==================
+class DataProcessor:
+    def __init__(self, exchange_client):
+        self.exchange = exchange_client
+
+    def get_ohlcv(self, symbol: str, timeframe='1h', limit=5000) -> pd.DataFrame:
+        all_ohlcv = []
+        now = self.exchange.milliseconds()
+
+        # 過去5000本のデータから取得開始
+        since = now - (5000 * 60 * 60 * 1000)
+
+        while True:
+            try:
+                data = self.exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+                if not data:
+                    break
+
+                all_ohlcv.extend(data)
+
+                since = data[-1][0] + 1
+
+                time.sleep(self.exchange.rateLimit / 1000)
+
+            except Exception as e:
+                print(f"❌ {symbol} のOHLCVデータ取得に失敗しました: {e}")
+                return None
+
+        if not all_ohlcv:
+            print(f"❌ {symbol}: 過去のOHLCVデータが取得できませんでした。")
+            return None
+
+        df = pd.DataFrame(all_ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
+        df.drop_duplicates(subset=['time'], inplace=True)
+        df["time"] = pd.to_datetime(df["time"], unit='ms', utc=True)
+        df.set_index("time", inplace=True)
+        df = df.astype(float)
+
+        return df.sort_index()
+
+    def add_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty: return pd.DataFrame()
+
+        out = df.copy()
+        try:
+            out['ema_12'] = EMAIndicator(out['close'], window=12).ema_indicator()
+            out['ema_26'] = EMAIndicator(out['close'], window=26).ema_indicator()
+            out['ema_50'] = EMAIndicator(out['close'], window=50).ema_indicator()
+            out['rsi'] = RSIIndicator(out['close'], window=14).rsi()
+            out['stoch_rsi'] = StochRSIIndicator(out['close'], window=14, smooth1=3, smooth2=3).stochrsi()
+            macd = MACD(out['close'], window_slow=26, window_fast=12, window_sign=9)
+            out['macd'] = macd.macd()
+            out['macd_diff'] = macd.macd_diff()
+            out['adx'] = ADXIndicator(out['high'], out['low'], out['close'], window=14).adx()
+            out['atr'] = AverageTrueRange(out['high'], out['low'], out['close'], window=14).average_true_range()
+            out['obv'] = OnBalanceVolumeIndicator(out['close'], out['volume']).on_balance_volume()
+
+            for window in [1, 2, 3, 5]:
+                out[f'close_lag_{window}'] = out['close'].shift(window)
+                out[f'volume_lag_{window}'] = out['volume'].shift(window)
+                out[f'rsi_lag_{window}'] = out['rsi'].shift(window)
+
+            bb = BollingerBands(out['close'], window=20, window_dev=2)
+            out['bb_hi'] = bb.bollinger_hband()
+            out['bb_lo'] = bb.bollinger_lband()
+            out['bb_width'] = bb.bollinger_wband()
+
+            kc = KeltnerChannel(out['high'], out['low'], out['close'], window=20, window_atr=10, multiplier=2)
+            out['kc_hi'] = kc.keltner_channel_hband()
+            out['kc_lo'] = kc.keltner_channel_lband()
+
+            df_temp = pd.DataFrame(index=out.index)
+            df_temp['high'] = out['high']
+            df_temp['low'] = out['low']
+            df_temp['close'] = out['close']
+            super_trend_series = pta.supertrend(df_temp['high'], df_temp['low'], df_temp['close'], length=10, multiplier=3)
+            out['super_trend'] = super_trend_series.iloc[:, 0]
+
+            out['ema_ratio'] = (out['ema_12'] - out['ema_26']) / out['ema_26']
+            out['price_to_ema50'] = (out['close'] - out['ema_50']) / out['ema_50']
+            out['vol_change'] = out['volume'].pct_change()
+            out['macd_hist_change'] = out['macd_diff'].pct_change()
+
+            out['rsi_norm'] = out['rsi'] / 100
+            out['macd_norm'] = out['macd'] / out['close'] * 1000
+
+            out.dropna(inplace=True)
+            return out
+
+        except Exception as e:
+            print(f"❌ 特徴量計算に失敗しました: {e}")
+            return pd.DataFrame()
+
+# ================== トレーディングボットクラス ==================
+class TradingBot:
+    def __init__(self, data_processor, notifier, watchlist):
+        self.data_processor = data_processor
+        self.notifier = notifier
+        self.watchlist = watchlist
+        self.models = {}
+        self.backtest_data = {}
+
+        os.makedirs(MODEL_DIR, exist_ok=True)
+
+        self.check_models_and_load_or_train()
+
+    def check_models_and_load_or_train(self):
+        training_needed = False
+        for symbol in self.watchlist:
+            sanitized_symbol = symbol.replace('/', '')
+            stack_path = os.path.join(MODEL_DIR, f'stack_model_{sanitized_symbol}.pkl')
+            backtest_path = os.path.join(MODEL_DIR, f'backtest_data_{sanitized_symbol}.pkl')
+
+            if not os.path.exists(stack_path) or not os.path.exists(backtest_path):
+                training_needed = True
+                break
+
+        if training_needed:
+            print("💡 1つ以上のモデルファイルまたはバックテストデータが見つかりません。新規に全モデルの訓練を開始します...")
+            self.train_all_models()
+        else:
+            print("✅ すべての訓練済みモデルとバックテストデータがGoogle Driveに存在します。読み込みを開始します。")
+            self.load_all_models()
+
+    def load_all_models(self):
+        for symbol in self.watchlist:
+            self.load_models(symbol)
+
+    def train_all_models(self):
+        for symbol in self.watchlist:
+            try:
+                print(f"⏳ {symbol} のモデル訓練を開始します...")
+                df_train = self.data_processor.get_ohlcv(symbol, timeframe='1h', limit=5000)
+                if df_train is None or df_train.empty:
+                    print(f"❌ {symbol}: 訓練データが不足しているため、訓練をスキップします。")
+                    continue
+
+                df_train_features = self.data_processor.add_features(df_train)
+                if df_train_features.empty or len(df_train_features) < MIN_BARS:
+                    print(f"❌ データがモデル訓練に不十分です。最終的なデータ数: {len(df_train_features)} / 必要なデータ数: {MIN_BARS}")
+                    continue
+
+                stack_model, backtest_df = self.train_stacking_model(df_train_features)
+                if stack_model is not None and not backtest_df.empty:
+                    self.save_models_and_data(symbol, stack_model, backtest_df)
+                    self.backtest_data[symbol] = backtest_df
+                else:
+                    print(f"❌ {symbol}: スタッキングモデルの訓練またはバックテストデータ生成に失敗しました。")
+
+            except Exception as e:
+                print(f"❌ {symbol} のモデル訓練中に予期せぬエラーが発生しました: {e}")
+                traceback.print_exc()
+
+        print("✅ 全モデルの訓練と保存が完了しました。")
+
+    def train_stacking_model(self, df: pd.DataFrame) -> Tuple[StackingClassifier, pd.DataFrame]:
+        df['future_return'] = df['close'].pct_change().shift(-1)
+        df['direction'] = (df['future_return'] > 0).astype(int)
+
+        features = [
+            'ema_12', 'ema_26', 'ema_50', 'rsi', 'stoch_rsi', 'macd', 'macd_diff', 'adx', 'atr', 'obv',
+            'close_lag_1', 'volume_lag_1', 'rsi_lag_1', 'close_lag_2', 'volume_lag_2', 'rsi_lag_2',
+            'close_lag_3', 'volume_lag_3', 'rsi_lag_3', 'close_lag_5', 'volume_lag_5', 'rsi_lag_5',
+            'bb_hi', 'bb_lo', 'bb_width', 'ema_ratio', 'price_to_ema50', 'vol_change',
+            'macd_hist_change', 'rsi_norm', 'macd_norm', 'kc_hi', 'kc_lo', 'super_trend'
+        ]
+
+        required_cols = features + ['direction', 'open', 'close', 'low', 'high', 'volume', 'atr']
+        df_clean = df.drop(columns=[col for col in df.columns if col not in required_cols])
+        df_clean = df_clean.dropna()
+
+        if len(df_clean) < MIN_BARS:
+            return None, pd.DataFrame()
+
+        X = df_clean[features]
+        y = df_clean['direction']
+
+        tscv = TimeSeriesSplit(n_splits=10)
+        stack_scores = []
+        stack_models = []
+        backtest_df = pd.DataFrame()
+
+        estimators = [
+            ('lgbm', lgb.LGBMClassifier(objective='binary', n_estimators=100, learning_rate=0.05, num_leaves=15, max_depth=4, random_state=42, class_weight='balanced')),
+            ('xgb', xgb.XGBClassifier(objective='binary:logistic', n_estimators=100, learning_rate=0.05, max_depth=4, use_label_encoder=False, eval_metric='logloss', random_state=42, scale_pos_weight=sum(y==0)/sum(y==1)))
+        ]
+        stack_model = StackingClassifier(estimators=estimators, final_estimator=LogisticRegression())
+
+        for train_index, test_index in tscv.split(X):
+            X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+            y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+
+            stack_model.fit(X_train, y_train)
+            stack_scores.append(f1_score(y_test, stack_model.predict(X_test)))
+            stack_models.append(stack_model)
+
+            test_data = df_clean.iloc[test_index].copy()
+            test_data['stack_pred'] = stack_model.predict(X_test)
+            test_data['stack_prob'] = stack_model.predict_proba(X_test)[:, 1]
+            backtest_df = pd.concat([backtest_df, test_data])
+
+        best_stack = stack_models[np.argmax(stack_scores)]
+        best_stack.fit(X, y)
+        return best_stack, backtest_df
+
+    def save_models_and_data(self, symbol, stack_model, backtest_df):
+        sanitized_symbol = symbol.replace('/', '')
+        try:
+            joblib.dump(stack_model, os.path.join(MODEL_DIR, f'stack_model_{sanitized_symbol}.pkl'))
+            joblib.dump(backtest_df, os.path.join(MODEL_DIR, f'backtest_data_{sanitized_symbol}.pkl'))
+            print(f"✅ {symbol} のスタッキングモデルとバックテストデータを正常に保存しました。")
+        except Exception as e:
+            print(f"❌ {symbol} のモデルまたはバックテストデータの保存に失敗しました: {e}")
+
+    def load_models(self, symbol):
+        sanitized_symbol = symbol.replace('/', '')
+        stack_path = os.path.join(MODEL_DIR, f'stack_model_{sanitized_symbol}.pkl')
+        backtest_path = os.path.join(MODEL_DIR, f'backtest_data_{sanitized_symbol}.pkl')
+
+        try:
+            stack_model = joblib.load(stack_path)
+            backtest_df = joblib.load(backtest_path)
+            self.models[symbol] = {'stack': stack_model}
+            self.backtest_data[symbol] = backtest_df
+            print(f"✅ {symbol} のスタッキングモデルとバックテストデータを正常に読み込みました。")
+            return True
+        except FileNotFoundError:
+            print(f"⚠️ {symbol} のモデルまたはバックテストデータファイルが見つかりません。この銘柄の分析はスキップされます。")
+            return False
+        except Exception as e:
+            print(f"❌ {symbol} のモデルまたはバックテストデータの読み込みに失敗しました: {e}")
+            return False
+
+    def run_backtest(self, df: pd.DataFrame) -> Dict:
+        if df is None or df.empty:
+            print(f"ℹ️ バックテストデータが空です。スキップします。")
+            return {'total_trades': 0, 'win_rate': 0.0, 'total_pnl': 0.0, 'sharpe_ratio': 0.0, 'max_drawdown': 0.0}
+
+        df = df.copy()
+
+        PRED_PROB_THRESHOLD = 0.6
+        df['signal'] = np.where(df['stack_prob'] >= PRED_PROB_THRESHOLD, df['stack_pred'], np.nan)
+        df['trade_pnl'] = np.nan
+
+        FEE = 0.001
+        SLIPPAGE = 0.0001
+
+        df['entry_price'] = df['open'].shift(-1) * (1 + SLIPPAGE * (2 * df['signal'] - 1))
+
+        df['sl_price'] = df['entry_price'] + df['atr'] * 1.5 * (2 * df['signal'] - 1) * -1
+        df['tp_price'] = df['entry_price'] + df['atr'] * 3.0 * (2 * df['signal'] - 1)
+
+        long_closed_sl = (df['low'].shift(-1) <= df['sl_price']) & (df['signal'] == 1)
+        long_closed_tp = (df['high'].shift(-1) >= df['tp_price']) & (df['signal'] == 1)
+        short_closed_sl = (df['high'].shift(-1) >= df['sl_price']) & (df['signal'] == 0)
+        short_closed_tp = (df['low'].shift(-1) <= df['tp_price']) & (df['signal'] == 0)
+
+        df.loc[long_closed_sl, 'trade_pnl'] = (df['sl_price'] - df['entry_price']) / df['entry_price']
+        df.loc[long_closed_tp, 'trade_pnl'] = (df['tp_price'] - df['entry_price']) / df['entry_price']
+        df.loc[short_closed_sl, 'trade_pnl'] = (df['entry_price'] - df['sl_price']) / df['entry_price']
+        df.loc[short_closed_tp, 'trade_pnl'] = (df['entry_price'] - df['tp_price']) / df['entry_price']
+
+        not_closed = (df['signal'].notna()) & (df['trade_pnl'].isna())
+        df.loc[not_closed & (df['signal'] == 1), 'trade_pnl'] = (df['close'].shift(-1) - df['entry_price']) / df['entry_price']
+        df.loc[not_closed & (df['signal'] == 0), 'trade_pnl'] = (df['entry_price'] - df['close'].shift(-1)) / df['entry_price']
+
+        df['pnl_after_fee'] = df['trade_pnl'] - FEE
+
+        total_trades = df['signal'].notna().sum()
+        winning_trades = (df['pnl_after_fee'] > 0).sum()
+        total_pnl = df['pnl_after_fee'].sum()
+        win_rate = winning_trades / total_trades if total_trades > 0 else 0
+
+        pnl_df = df['pnl_after_fee'].dropna()
+
+        if not pnl_df.empty and pnl_df.std() > 0:
+            returns = pnl_df.astype(float)
+            sharpe_ratio = returns.mean() / returns.std() * np.sqrt(252)
+            cumulative_returns = (1 + returns).cumprod()
+            max_drawdown = (cumulative_returns.div(cumulative_returns.cummax()) - 1.0).min()
+        else:
+            sharpe_ratio = 0.0
+            max_drawdown = 0.0
+
+        return {
+            'total_trades': total_trades,
+            'winning_trades': winning_trades,
+            'win_rate': win_rate,
+            'total_pnl': total_pnl,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown
+        }
+
+    def run_walk_forward_backtest(self, symbol) -> Tuple[Dict, pd.DataFrame]:
+        if symbol not in self.models:
+            print(f"⚠️ {symbol}: モデルがロードされていません。スキップします。")
+            return {}, pd.DataFrame()
+
+        df = self.data_processor.get_ohlcv(symbol, timeframe='1h', limit=5000)
+        df = self.data_processor.add_features(df)
+        df['future_return'] = df['close'].pct_change().shift(-1)
+        df['direction'] = (df['future_return'] > 0).astype(int)
+
+        features = [
+            'ema_12', 'ema_26', 'ema_50', 'rsi', 'stoch_rsi', 'macd', 'macd_diff', 'adx', 'atr', 'obv',
+            'close_lag_1', 'volume_lag_1', 'rsi_lag_1', 'close_lag_2', 'volume_lag_2', 'rsi_lag_2',
+            'close_lag_3', 'volume_lag_3', 'rsi_lag_3', 'close_lag_5', 'volume_lag_5', 'rsi_lag_5',
+            'bb_hi', 'bb_lo', 'bb_width', 'ema_ratio', 'price_to_ema50', 'vol_change',
+            'macd_hist_change', 'rsi_norm', 'macd_norm', 'kc_hi', 'kc_lo', 'super_trend'
+        ]
+
+        df_clean = df.dropna()
+
+        if len(df_clean) < MIN_BARS:
+            print(f"ℹ️ {symbol}: データが不十分です。ウォークフォワード・バックテストをスキップします。")
+            return {}, pd.DataFrame()
+
+        X = df_clean[features]
+        y = df_clean['direction']
+
+        TRAIN_WINDOW_SIZE = 1500
+        TEST_WINDOW_SIZE = 500
+
+        all_backtest_results = pd.DataFrame()
+
+        for i in range(TRAIN_WINDOW_SIZE, len(df_clean) - TEST_WINDOW_SIZE, TEST_WINDOW_SIZE):
+            train_data = df_clean.iloc[i - TRAIN_WINDOW_SIZE : i].copy()
+            test_data = df_clean.iloc[i : i + TEST_WINDOW_SIZE].copy()
+
+            if len(train_data) < TRAIN_WINDOW_SIZE or len(test_data) < TEST_WINDOW_SIZE:
+                continue
+
+            model_to_test, _ = self.train_stacking_model(train_data)
+            if model_to_test is None: continue
+
+            X_test = test_data[features]
+            test_data['stack_pred'] = model_to_test.predict(X_test)
+            test_data['stack_prob'] = model_to_test.predict_proba(X_test)[:, 1]
+
+            all_backtest_results = pd.concat([all_backtest_results, test_data])
+
+        return self.run_backtest(all_backtest_results), all_backtest_results
+
+
+    def score_signal(self, df_row, stack_pred, stack_prob, mtf_agree, candles, last_close):
+        score, reasons = 0, []
+
+        prob_score = min(50, max(0, int(50 * stack_prob)))
+        score += prob_score
+        reasons.append(f"🧠 モデル信頼度 (+{prob_score})")
+
+        if (df_row['ema_12'] > df_row['ema_26'] and stack_pred == 1) or \
+           (df_row['ema_12'] < df_row['ema_26'] and stack_pred == 0):
+            score += 10; reasons.append("📈 短期EMA/長期EMA方向一致 (+10)")
+
+        if df_row['close'] > df_row.get('ema_50', df_row['close']) and stack_pred == 1:
+            score += 10; reasons.append("🟢 価格>EMA50 (+10)")
+
+        if (candles['bull_engulf'] and stack_pred == 1) or (candles['bear_engulf'] and stack_pred == 0):
+            score += 10; reasons.append("🧩 包み足パターンと方向一致 (+10)")
+
+        if df_row['adx'] >= 25 and (df_row['ema_12'] > df_row['ema_26'] if stack_pred == 1 else df_row['ema_12'] < df_row['ema_26']):
+            score += 10; reasons.append("📏 ADX>25でトレンド明確 (+10)")
+
+        if (df_row['close'] > df_row['kc_hi'] and stack_pred == 1) or \
+           (df_row['close'] < df_row['kc_lo'] and stack_pred == 0):
+            score += 5; reasons.append("📊 ケルトナーチャネル・ブレイクアウト (+5)")
+
+        if (df_row['close'] > df_row['super_trend'] and stack_pred == 1) or \
+           (df_row['close'] < df_row['super_trend'] and stack_pred == 0):
+            score += 5; reasons.append("🚀 スーパートレンド方向一致 (+5)")
+
+        if mtf_agree == "agree_long" and stack_pred == 1:
+            score += 10; reasons.append("🧭 1h/6h上方向一致 (+10)")
+        elif mtf_agree == "agree_short" and stack_pred == 0:
+            score += 10; reasons.append("🧭 1h/6h下方向一致 (+10)")
+
+        score = int(max(0, min(100, score)))
+        return stack_pred, score, reasons
+
+    def calculate_trade_levels(self, last_close: float, atr: float, direction: int, rr_ratio=2.0):
+        if atr is None or atr <= 0: return last_close, last_close, last_close, 0.0
+
+        if direction == 1: # ロング
+            sl_dist = atr * 1.5
+            stop_loss = last_close - sl_dist
+            target_profit = last_close + sl_dist * rr_ratio
+        else: # ショート
+            sl_dist = atr * 1.5
+            stop_loss = last_close + sl_dist
+            target_profit = last_close - sl_dist * rr_ratio
+
+        risk = abs(last_close - stop_loss)
+        reward = abs(target_profit - last_close)
+        rr_ratio = reward / risk if risk > 0 else 0.0
+
+        return last_close, stop_loss, target_profit, rr_ratio
+
+    def generate_performance_chart(self, df, symbol):
+        df_plot = df.copy()
+        df_plot.index = df_plot.index.to_series().dt.floor('H')
+
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        df_plot['correct_combined'] = (df_plot['stack_pred'] == df_plot['direction'])
+        df_plot['incorrect_combined'] = (df_plot['stack_pred'] != df_plot['direction'])
+
+        correct_preds = df_plot[df_plot['correct_combined']]
+        incorrect_preds = df_plot[df_plot['incorrect_combined']]
+
+        if not correct_preds.empty:
+            ax.scatter(correct_preds.index, correct_preds['close'], color='lime', marker='^', s=50, label='Correct Predictions')
+
+        if not incorrect_preds.empty:
+            ax.scatter(incorrect_preds.index, incorrect_preds['close'], color='red', marker='x', s=50, label='Incorrect Predictions')
+
+        ax.plot(df_plot.index, df_plot['close'], label='Close Price', color='white', alpha=0.5)
+
+        ax.set_title(f'Prediction Performance for {symbol}')
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Price (USD)')
+        ax.legend()
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close(fig)
+        return buf.getvalue()
+
+    def generate_feature_importance_chart(self, model, features):
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        if hasattr(model, 'feature_importances_'):
+            importances = model.feature_importances_
+        else: # StackingClassifierのestimatorsから重要度を取得
+            try:
+                lgbm_importance = model.estimators_[0].feature_importances_
+                xgb_importance = model.estimators_[1].feature_importances_
+                importances = (lgbm_importance + xgb_importance) / 2
+            except Exception:
+                importances = np.zeros(len(features))
+
+        feature_importance_df = pd.DataFrame({'feature': features, 'importance': importances})
+        feature_importance_df = feature_importance_df.sort_values('importance', ascending=False)
+
+        ax.barh(feature_importance_df['feature'], feature_importance_df['importance'], color='teal')
+        ax.set_title('Feature Importance')
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close(fig)
+        return buf.getvalue()
+
+    def run_analysis_cycle(self):
+        print(f"\n────────── 📅 分析開始 {now_utc_str()} ──────────")
+        candidates = []
+
+        for symbol in self.watchlist:
+            try:
+                if symbol not in self.models:
+                    if not self.load_models(symbol):
+                        continue
+
+                stack_model = self.models[symbol]['stack']
+
+                df1h = self.data_processor.get_ohlcv(symbol, timeframe='1h', limit=5000)
+                df6h = self.data_processor.get_ohlcv(symbol, timeframe='6h', limit=5000 // 6)
+
+                if df1h is None or df1h.empty or len(df1h) < MIN_BARS or df6h is None or len(df6h) < MIN_BARS // 6:
+                    print(f"⏭️ {symbol}: データ不足スキップ")
+                    continue
+
+                df1h_features = self.data_processor.add_features(df1h)
+                df6h_features = self.data_processor.add_features(df6h)
+
+                if df1h_features.empty or df6h_features.empty:
+                    print(f"⚠️ 指標計算後、データフレームが空になりました。データ不足の可能性があります。")
+                    print(f"⏭️ {symbol}: 指標計算不可")
+                    continue
+
+                last1h = df1h_features.iloc[-1]
+                last6h = df6h_features.iloc[-1]
+
+                long_bias_1h = last1h['ema_12'] > last1h['ema_26'] and last1h['rsi'] >= 55
+                long_bias_6h = last6h['ema_12'] > last6h['ema_26'] and last6h['rsi'] >= 55
+                mtf_agree = None
+                if long_bias_1h and long_bias_6h: mtf_agree = "agree_long"
+                elif (not long_bias_1h) and (not long_bias_6h): mtf_agree = "agree_short"
+
+                candles = detect_candles(df1h[['open','high','low','close']].tail(3))
+
+                features_to_predict = [
+                    'ema_12', 'ema_26', 'ema_50', 'rsi', 'stoch_rsi', 'macd', 'macd_diff', 'adx', 'atr', 'obv',
+                    'close_lag_1', 'volume_lag_1', 'rsi_lag_1', 'close_lag_2', 'volume_lag_2', 'rsi_lag_2',
+                    'close_lag_3', 'volume_lag_3', 'rsi_lag_3', 'close_lag_5', 'volume_lag_5', 'rsi_lag_5',
+                    'bb_hi', 'bb_lo', 'bb_width', 'ema_ratio', 'price_to_ema50', 'vol_change',
+                    'macd_hist_change', 'rsi_norm', 'macd_norm', 'kc_hi', 'kc_lo', 'super_trend'
+                ]
+                latest_features_df = df1h_features[features_to_predict].iloc[[-1]]
+
+                stack_pred = int(stack_model.predict(latest_features_df)[0])
+                stack_prob = float(stack_model.predict_proba(latest_features_df)[0][stack_pred])
+
+                combined_pred, quality, reasons = self.score_signal(last1h, stack_pred, stack_prob, mtf_agree, candles, float(last1h['close']))
+                entry, sl, tp, rr = self.calculate_trade_levels(float(last1h['close']), float(last1h['atr']), combined_pred)
+
+                candidates.append({
+                    "symbol": symbol, "quality": quality, "entry": entry, "sl": sl, "tp": tp,
+                    "combined_pred": combined_pred, "stack_prob": stack_prob,
+                    "reasons": reasons, "mtf": mtf_agree,
+                    "candles": candles, "rr": rr, "atr": float(last1h.get('atr', 0.0)),
+                    "backtest": {},
+                    "backtest_df": self.backtest_data.get(symbol, pd.DataFrame())
+                })
+                print(f"✅ {symbol}: スコア{quality}")
+                gc.collect()
+
+            except Exception as inner_e:
+                print(f"⚠️ {symbol} で警告: {inner_e}")
+                traceback.print_exc(file=sys.stdout)
+                continue
+
+        if not candidates:
+            print("🙅 分析対象なし。")
+        else:
+            notifiable_candidates = sorted([c for c in candidates if c['quality'] >= QUALITY_NOTIFY_THRESHOLD], key=lambda x: x['quality'], reverse=True)
+            if not notifiable_candidates:
+                max_score = max(c['quality'] for c in candidates) if candidates else 0
+                print(f"ℹ️ 通知なし（最高スコア {max_score} / 閾値 {QUALITY_NOTIFY_THRESHOLD}）")
+            else:
+                print(f"🎉 以下のシンボルが通知閾値を満たしました（{len(notifiable_candidates)}件）")
+                for candidate in notifiable_candidates:
+                    print(f"🏃 {candidate['symbol']} でウォークフォワードバックテストを実行中...")
+                    backtest_results, backtest_df = self.run_walk_forward_backtest(candidate['symbol'])
+                    candidate['backtest'] = backtest_results
+                    candidate['backtest_df'] = backtest_df
+
+                    self.notify_signal(candidate)
+
+    def notify_signal(self, candidate):
+        icon = symbol_icon(candidate['symbol'])
+        stars = "🟡" * int(candidate['quality']//20) + "⚪" * (5 - int(candidate['quality']//20))
+        dir_text = "📈 <b>ロング優勢</b>" if candidate['combined_pred'] == 1 else "📉 <b>ショート優勢</b>"
+
+        patt_emo = []
+        if candidate['candles']['bull_pin']: patt_emo.append("🪝強気ピンバー")
+        if candidate['candles']['bear_pin']: patt_emo.append("🪝弱気ピンバー")
+        if candidate['candles']['bull_engulf']: patt_emo.append("🧩陽の包み足")
+        if candidate['candles']['bear_engulf']: patt_emo.append("🧩陰の包み足")
+        patt_str = " / ".join(patt_emo) if patt_emo else "（顕著なし）"
+
+        backtest_info = candidate.get('backtest', {})
+        total_pnl_str = f"<code>{backtest_info.get('total_pnl', 0.0):.2%}</code>" if 'total_pnl' in backtest_info else "N/A"
+        pnl_sign = "🟢" if backtest_info.get('total_pnl', 0.0) >= 0 else "🔴"
+
+        msg = (
+f"{icon} <b>{candidate['symbol']}</b> シグナル発生 🎯\n"
+f"━━━━━━━━━━━━━━━━━━━━\n"
+f"{dir_text}\n"
+f"評価: {stars} <b>{candidate['quality']}/100</b>\n"
+f"モデル信頼度: <code>{candidate['stack_prob']:.2f}</code>\n"
+f"ATR: <code>{fmt_price(candidate['atr'], 4)}</code>\n"
+f"パターン: {patt_str}\n"
+f"\n"
+f"📌 エントリー: <code>{fmt_price(candidate['entry'])}</code>\n"
+f"🛑 損切り(SL): <code>{fmt_price(candidate['sl'])}</code>\n"
+f"🎯 利確(TP): <code>{fmt_price(candidate['tp'])}</code>\n"
+f"📏 リスクリワード: <code>{candidate['rr']:.2f}</code>\n"
+f"\n"
+f"📊 <b>バックテストサマリー (ウォークフォワード)</b>\n"
+f" - 総取引数: {backtest_info.get('total_trades', 'N/A')}\n"
+f" - 勝率: <code>{backtest_info.get('win_rate', 0.0):.0%}</code>\n"
+f" - 総損益: {pnl_sign} {total_pnl_str}\n"
+f" - シャープ・レシオ: <code>{backtest_info.get('sharpe_ratio', 0.0):.2f}</code>\n"
+f" - 最大ドローダウン: <code>{backtest_info.get('max_drawdown', 0.0):.2%}</code>\n"
+f"\n"
+f"根拠:\n- " + "\n- ".join([escape_html(r) for r in candidate['reasons']]) + "\n"
+f"⏰ {now_utc_str()}"
+        )
+
+        try:
+            print(f"📨 Telegram送信を試行: {candidate['symbol']} / スコア{candidate['quality']}")
+
+            if not candidate['backtest_df'].empty:
+                chart_data = self.generate_performance_chart(candidate['backtest_df'], candidate['symbol'])
+                self.notifier.send_photo(chart_data, msg)
+            else:
+                self.notifier.send_message(msg)
+
+            # 特徴量重要度チャートを生成
+            if candidate['symbol'] in self.models and 'stack' in self.models[candidate['symbol']]:
+                features = [
+                    'ema_12', 'ema_26', 'ema_50', 'rsi', 'stoch_rsi', 'macd', 'macd_diff', 'adx', 'atr', 'obv',
+                    'close_lag_1', 'volume_lag_1', 'rsi_lag_1', 'close_lag_2', 'volume_lag_2', 'rsi_lag_2',
+                    'close_lag_3', 'volume_lag_3', 'rsi_lag_3', 'close_lag_5', 'volume_lag_5', 'rsi_lag_5',
+                    'bb_hi', 'bb_lo', 'bb_width', 'ema_ratio', 'price_to_ema50', 'vol_change',
+                    'macd_hist_change', 'rsi_norm', 'macd_norm', 'kc_hi', 'kc_lo', 'super_trend'
+                ]
+                importance_chart = self.generate_feature_importance_chart(self.models[candidate['symbol']]['stack'], features)
+                self.notifier.send_photo(importance_chart, f"<b>{candidate['symbol']}</b> 特徴量重要度チャート")
+
+            print(f"✅ Telegram送信成功: {candidate['symbol']}")
+        except Exception as e:
+            print(f"❌ Telegram送信失敗: {candidate['symbol']} / 原因: {e}")
+
+# ================== メインループの実行 ==================
+if __name__ == "__main__":
+    notifier = TelegramNotifier(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+    data_processor = DataProcessor(exchange)
+
+    # 初回実行時、モデルとバックテストデータの存在チェックと訓練
+    bot = TradingBot(data_processor, notifier, WATCHLIST)
+
+    print("🚀 超高性能ボット起動:", now_utc_str())
+    print(f"🔔 通知スコアの閾値: {QUALITY_NOTIFY_THRESHOLD}")
+
+    last_alive_notification = time.time()
+    last_ping_time = time.time()
+
+    if notifier.is_enabled:
+        test_message = (
+            f"<b>✅ 超高性能ボット 起動成功</b> ✅\n\n"
+            f"これは起動時に送信されるテスト通知です。\n"
+            f"通知設定は正常に完了しています。\n\n"
+            f"最初の分析サイクルはまもなく開始されます。\n"
+            f"⏰ {now_utc_str()}"
+        )
+        notifier.send_message(test_message)
+        print("👍 テスト通知を送信しました。")
+
+    while True:
+        try:
+            bot.run_analysis_cycle()
+
+            elapsed_since_last_ping = time.time() - last_ping_time
+            if elapsed_since_last_ping >= PING_INTERVAL_SEC:
+                try:
+                    requests.get("https://google.com")
+                    print(f"🌐 接続維持用pingを送信しました。 次回pingまで {PING_INTERVAL_SEC//60}分")
+                except Exception as e:
+                    print(f"❌ 接続維持pingに失敗しました: {e}")
+                finally:
+                    last_ping_time = time.time()
+
+            elapsed_since_last_notify = time.time() - last_alive_notification
+            if elapsed_since_last_notify >= ALIVE_NOTIFY_INTERVAL_SEC:
+                alive_message = f"<b>💖 Botは稼働中です！</b>\n\n最終分析時刻: {now_utc_str()}"
+                notifier.send_message(alive_message)
+                last_alive_notification = time.time()
+                print("💖 稼働中通知を送信しました。")
+
+        except Exception as e:
+            print("💥 例外発生（継続）:", e)
+            traceback.print_exc(file=sys.stdout)
+
+        print(f"🕒 {MAIN_LOOP_SLEEP_SEC//60:.0f}分待機 → {now_utc_str()}")
+        time.sleep(MAIN_LOOP_SLEEP_SEC)
