@@ -1,129 +1,159 @@
 # trading_executor.py
-import os
 import logging
 import math
+import os
 from typing import Optional, Dict, Any
 
 import ccxt
 
-logger = logging.getLogger(__name__)
-
+# PAPER_TRADING フラグは環境変数で管理
+PAPER_TRADING = os.getenv("PAPER_TRADING", "1") != "0"
+BITGET_API_KEY = os.getenv("BITGET_API_KEY_FUTURES")
+BITGET_API_SECRET = os.getenv("BITGET_API_SECRET_FUTURES")
+BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE_FUTURES")
 
 class TradingExecutor:
     """
-    Bitget Futures (USDT perpetual) を想定した実注文ラッパー。
-    PAPER_TRADING 環境変数でトレードをシミュレーション可能。
+    Bitget Futures を使う注文実行クラス（ccxt ベース）。
+    PaperTrading の場合は実注文を送らずに StateManager を更新する運用を想定。
     """
-
-    def __init__(self):
-        self.api_key = os.getenv("BITGET_API_KEY")
-        self.api_secret = os.getenv("BITGET_API_SECRET")
-        self.api_password = os.getenv("BITGET_API_PASSWORD", "")
-        self.paper_trading = os.getenv("PAPER_TRADING", "True") in ["True", "true", "1"]
-        # ccxt exchange (futures default)
+    def __init__(self, state_manager):
+        self.state = state_manager
         self.exchange = None
         try:
             self.exchange = ccxt.bitget({
-                "apiKey": self.api_key,
-                "secret": self.api_secret,
-                "password": self.api_password,
+                "apiKey": BITGET_API_KEY,
+                "secret": BITGET_API_SECRET,
+                "password": BITGET_API_PASSPHRASE,
                 "enableRateLimit": True,
-                "options": {"defaultType": "swap"}
             })
-            logger.info("Initialized ccxt.bitget for futures.")
+            # 一部 ccxt の bitget は futures を .set_sandbox_mode or options
+            # ensure defaultType future/perpetual if supported:
+            try:
+                self.exchange.options['defaultType'] = 'swap'
+            except Exception:
+                pass
+            logging.info("Initialized ccxt.bitget for futures.")
         except Exception as e:
-            logger.warning("Failed to init ccxt.bitget: %s", e)
+            logging.warning("Could not initialize ccxt.bitget: %s", e)
             self.exchange = None
 
-    def _market_info(self, symbol: str) -> Optional[Dict[str, Any]]:
-        if not self.exchange:
-            return None
-        try:
-            m = self.exchange.load_markets()
-            return self.exchange.market(symbol)
-        except Exception as e:
-            logger.debug("market_info fetch failed: %s", e)
-            return None
-
-    def _round_amount(self, symbol: str, amount_asset: float) -> float:
+    # ---------- helpers ----------
+    def _round_amount(self, symbol: str, amount: float) -> float:
         """
-        取引所の最小数量刻みで丸める
+        Query market info to get min/max/precision; fallback to reasonable rounding.
         """
-        market = self._market_info(symbol)
-        if not market:
-            return round(amount_asset, 8)
-        step = market.get("precision", {}).get("amount")
-        if step is None:
-            step = market.get("limits", {}).get("amount", {}).get("min", 0.000001)
-        # step might be decimal places; try to round to step's decimal places
         try:
-            step = float(step)
-            if step <= 0:
-                return round(amount_asset, 8)
-            # compute decimals
-            decimals = max(0, int(-math.floor(math.log10(step)))) if step < 1 else 0
-            rounded = math.floor(amount_asset / step) * step
-            return round(rounded, decimals)
+            markets = self.exchange.load_markets()
+            m = markets.get(symbol) or markets.get(symbol.replace("/", "")) or None
+            if m:
+                step = m.get("limits", {}).get("amount", {}).get("min") or m.get("precision", {}).get("amount")
+                if step:
+                    return math.floor(amount / float(step)) * float(step)
+                # fallback to precision
+                p = m.get("precision", {}).get("amount")
+                if p is not None:
+                    fmt = "{:." + str(p) + "f}"
+                    return float(fmt.format(amount))
         except Exception:
-            return round(amount_asset, 8)
+            pass
+        # fallback: round to 6 decimals
+        return float(round(amount, 6))
 
-    def set_leverage(self, symbol: str, leverage: int = 10):
+    def _market_symbol(self, symbol: str) -> str:
         """
-        CCXTのset_leverage が使えるなら呼ぶ。取引所によりパラメータが異なる。
+        Convert e.g. 'BTC' to Bitget futures symbol used by ccxt: 'BTC/USDT:USDT' or 'BTC/USDT'
+        We'll use 'BTC/USDT:USDT' which is common in bitget ccxt for swap.
         """
-        if self.paper_trading or not self.exchange:
-            logger.debug("[PAPER] set_leverage skipped")
-            return
+        return f"{symbol}/USDT:USDT"
+
+    # ---------- open position ----------
+    def open_position(self, symbol: str, side: str, size_usd: float, entry_price: float, take_profit: float,
+                      stop_loss: float, leverage: float = 3.0, partial_steps: Optional[list] = None) -> Dict[str, Any]:
+        """
+        Open futures position (market) for given USD notional: size_usd -> amount units = size_usd / price
+        side: 'long' or 'short'
+        partial_steps: list of ratios for partial closes e.g. [0.5, 0.25, 0.25]
+        Returns order / simulated result
+        """
+        symbol_pair = self._market_symbol(symbol)
+        amount_asset = size_usd / float(entry_price) if entry_price > 0 else 0.0
+        amount_asset = self._round_amount(symbol_pair, amount_asset)
+        logging.info(f"Opening {side} {symbol} size_usd={size_usd:.2f} => amount={amount_asset:.6f} @ {entry_price:.6f}")
+
+        if PAPER_TRADING or not self.exchange:
+            # simulate: register in state
+            self.state.open_position(symbol, side, entry_price, amount_asset, take_profit, stop_loss, leverage)
+            logging.info(f"PAPER: simulated open {symbol} {side} amt={amount_asset}")
+            return {"simulated": True, "symbol": symbol, "side": side, "amount": amount_asset}
+
+        # live order flow (ccxt bitget)
         try:
-            # ccxt may have set_leverage
-            self.exchange.set_leverage(leverage, symbol)
-            logger.info("Set leverage %sx for %s", leverage, symbol)
+            market_symbol = symbol_pair
+            # set leverage if exchange supports via set_leverage method / private endpoint
+            try:
+                if hasattr(self.exchange, "set_leverage"):
+                    # ccxt may require params: {'symbol': market_symbol, 'leverage': leverage}
+                    self.exchange.set_leverage(leverage, market_symbol)
+                else:
+                    # Some exchanges need positionMarginMode or set margin mode
+                    pass
+            except Exception as e:
+                logging.warning("Failed to set leverage: %s", e)
+
+            # create market order: buy/sell depends on side and position direction; for futures we use create_order
+            if side.lower() == "long":
+                order = self.exchange.create_market_buy_order(market_symbol, amount_asset)
+            else:
+                order = self.exchange.create_market_sell_order(market_symbol, amount_asset)
+
+            # Save position info in state with entry price from order response if available
+            executed_price = order.get("average") or order.get("price") or entry_price
+            self.state.open_position(symbol, side, executed_price, amount_asset, take_profit, stop_loss, leverage)
+            return {"order": order}
         except Exception as e:
-            logger.warning("set_leverage failed: %s", e)
+            logging.exception("Failed to place live order: %s", e)
+            return {"error": str(e)}
 
-    def create_market_order(self, symbol: str, side: str, size_asset: float, reduce_only: bool = False) -> Dict:
+    # ---------- close position (full or partial) ----------
+    def close_position(self, symbol: str, portion: float = 1.0) -> Dict[str, Any]:
         """
-        実市場にマーケット注文を送る (futures)。
-        side: 'long' -> 'buy' to open long; 'short' -> 'sell' to open short (depends on exchange convention)
-        size_asset: asset quantity
+        Close a portion of a position. portion: 0.0-1.0 (1.0 => all).
+        If PAPER_TRADING, simulate exit at current price from exchange ticker.
         """
-        if self.paper_trading:
-            logger.info(f"[PAPER] create_market_order: {symbol} {side} size={size_asset}")
-            return {"id": "paper_order", "symbol": symbol, "side": side, "size": size_asset}
+        if not self.state.has_position(symbol):
+            raise KeyError("No open position to close for " + symbol)
+        pos = self.state.get_positions().get(symbol)
+        side = pos["side"]
+        amt_total = float(pos["amount"])
+        close_amount = amt_total * float(portion)
+        market_sym = self._market_symbol(symbol)
 
-        if not self.exchange:
-            raise RuntimeError("Exchange not initialized")
-
-        # ccxt create_order requires side buy/sell
-        ccxt_side = "buy" if side.lower() == "long" else "sell"
-        amount = self._round_amount(symbol, size_asset)
+        if PAPER_TRADING or not self.exchange:
+            # simulate using current price
+            price = None
+            try:
+                ticker = self.exchange.fetch_ticker(market_sym) if self.exchange else None
+                price = ticker.get("last") if ticker else None
+            except Exception:
+                price = None
+            if price is None:
+                # fallback: use entry price as exit (zero PnL)
+                price = float(pos["entry_price"])
+            rec = self.state.close_position(symbol, price, reason=f"PAPER_CLOSE_{portion}")
+            logging.info(f"PAPER: closed {portion*100:.0f}% of {symbol} at {price} -> pnl {rec['pnl']:.4f}")
+            return {"simulated": True, "closed": portion, "pnl": rec["pnl"]}
+        # live flow
         try:
-            params = {"reduceOnly": reduce_only}
-            order = self.exchange.create_order(symbol, "market", ccxt_side, amount, None, params)
-            logger.info("Order result: %s", order)
-            return order
+            # decide order direction: to close long -> sell; to close short -> buy
+            if side == "long":
+                order = self.exchange.create_market_sell_order(market_sym, close_amount, {"reduceOnly": True})
+            else:
+                order = self.exchange.create_market_buy_order(market_sym, close_amount, {"reduceOnly": True})
+            # Ideally verify executed price and record
+            executed_price = order.get("average") or order.get("price")
+            rec = self.state.close_position(symbol, executed_price, reason="LIVE_CLOSE")
+            return {"order": order, "pnl": rec["pnl"]}
         except Exception as e:
-            logger.error("create_market_order failed: %s", e)
-            raise
-
-    def close_position_market(self, symbol: str, pos_side: str, size_asset: float) -> Dict:
-        """
-        ポジションを市場でクローズ（全量or一部）する。
-        pos_side is current position side ('long' or 'short'). To close a long -> sell, to close short -> buy.
-        """
-        if self.paper_trading:
-            logger.info(f"[PAPER] close_position_market: {symbol} {pos_side} size={size_asset}")
-            return {"id": "paper_close"}
-        if not self.exchange:
-            raise RuntimeError("Exchange not initialized")
-        # To close a long, we send sell; to close short, we send buy
-        side = "sell" if pos_side.lower() == "long" else "buy"
-        try:
-            amount = self._round_amount(symbol, size_asset)
-            params = {"reduceOnly": True}
-            order = self.exchange.create_order(symbol, "market", side, amount, None, params)
-            logger.info("Close order: %s", order)
-            return order
-        except Exception as e:
-            logger.error("close_position_market failed: %s", e)
-            raise
+            logging.exception("Failed to close position live: %s", e)
+            return {"error": str(e)}
