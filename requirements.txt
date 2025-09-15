@@ -13,4 +13,5 @@ pycoingecko
 python-telegram-bot
 googletrans==4.0.0-rc1
 feedparser
+numpy
 
