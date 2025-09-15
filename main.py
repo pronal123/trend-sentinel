@@ -1,496 +1,487 @@
 # main.py
 import os
-import time
 import logging
+import time
+import math
 import threading
 import schedule
 import requests
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any
+from typing import Dict, Any, List, Tuple
 
 import ccxt
 import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify
 
 from state_manager import StateManager
 from trading_executor import TradingExecutor
-from backtester import Backtester
 
-# -----------------------------
-# Config & Environment
-# -----------------------------
+load_dotenv()
+
+# -------- CONFIG ----------
 JST = timezone(timedelta(hours=9))
-LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-
-BITGET_API_KEY = os.getenv("BITGET_API_KEY_FUTURES")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET_FUTURES")
-BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE_FUTURES")
-
+BITGET_API_KEY = os.getenv("BITGET_API_KEY_FUTURES", "")
+BITGET_API_SECRET = os.getenv("BITGET_API_SECRET_FUTURES", "")
+BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE_FUTURES", "")
 PAPER_TRADING = os.getenv("PAPER_TRADING", "1") != "0"
-MONITORED_COUNT = int(os.getenv("MONITORED_COUNT", "30"))
-POSITION_SIZE_USD = float(os.getenv("POSITION_SIZE_USD", "100"))
+MONITORED_TOP_N = int(os.getenv("MONITORED_TOP_N", "30"))
+POSITION_USD = float(os.getenv("POSITION_SIZE_USD", "100"))
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "2.0"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-CYCLE_MINUTES = int(os.getenv("CYCLE_MINUTES", "1"))
-
 STATUS_KEY = os.getenv("STATUS_KEY", "changeme")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-BACKTEST_TRADES = int(os.getenv("BACKTEST_TRADES", "1000"))
-SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.005"))
-FEE_PCT = float(os.getenv("FEE_PCT", "0.0006"))
+# external
+FEAR_GREED_URL = os.getenv("PROXY_URL", "https://api.alternative.me/fng/")
 
-# -----------------------------
-# Init components
-# -----------------------------
+# logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# state and executor
 state = StateManager()
 executor = TradingExecutor(state)
-backtester = Backtester(fee_pct=FEE_PCT, slippage_pct=SLIPPAGE_PCT)
 
-# ccxt exchange client for data
-exchange = None
-try:
-    exchange = ccxt.bitget({"enableRateLimit": True})
-    exchange.options['defaultType'] = 'swap'
-    exchange.load_markets()
-    logging.info("Connected to ccxt.bitget for data")
-except Exception as e:
-    logging.warning("Could not init ccxt for data: %s", e)
-    exchange = None
+# ccxt client for market data (no API keys needed for public data)
+ccxt_client = ccxt.bitget({
+    "enableRateLimit": True,
+})
 
-# -----------------------------
-# Utility functions
-# -----------------------------
+app = Flask(__name__)
+
+# ---------------- helpers ----------------
+def utcnow_jst_iso():
+    return datetime.now(timezone.utc).astimezone(JST).isoformat()
+
 def send_telegram_html(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logging.debug("Telegram not configured.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
-        requests.post(url, json=payload, timeout=8)
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        logging.error("Telegram send failed: %s", e)
+        logging.error("send_telegram error: %s", e)
 
-def fetch_fear_and_greed():
-    proxy = os.getenv("PROXY_URL", "https://api.alternative.me/fng/")
+# fetch Fear & Greed
+def fetch_fear_and_greed() -> Dict[str, Any]:
     try:
-        r = requests.get(proxy, timeout=6).json()
+        r = requests.get(FEAR_GREED_URL, timeout=8).json()
         return r.get("data", [{}])[0]
-    except Exception as e:
-        logging.debug("F&G fetch failed: %s", e)
+    except Exception:
         return {"value": "N/A", "value_classification": "Unknown"}
 
-def get_top_symbols_by_volume(limit: int = MONITORED_COUNT) -> List[str]:
-    """
-    Uses ccxt fetch_tickers / markets to pick top-volume perpetual USDT symbols.
-    """
-    if not exchange:
-        # fallback: common list
-        return ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA"][:limit]
+# get top volume symbols from Bitget futures markets
+def fetch_top_symbols(limit: int = MONITORED_TOP_N) -> List[str]:
     try:
-        # fetch tickers and sort by quoteVolume if available
-        tickers = exchange.fetch_tickers()
-        candidates = []
-        for sym, info in tickers.items():
-            # filter to USDT perpetual style symbols
-            if "USDT" not in sym:
-                continue
-            # unify symbol like BTC/USDT:USDT -> symbol name BTC
-            try:
+        markets = ccxt_client.fetch_markets()
+        # filter USDT perpetual / swap markets
+        swaps = [m for m in markets if m.get("quote") == "USDT" and (m.get("type") in (None, "swap", "future") or "USDT" in (m.get("symbol","")))]
+        # get by quoteVolume24h if available
+        swaps_sorted = sorted(swaps, key=lambda m: float(m.get("info", {}).get("volumeUsd24h", 0) or 0), reverse=True)
+        res = []
+        for m in swaps_sorted:
+            sym = m.get("symbol")
+            # normalize to base like 'BTC'
+            if "/" in sym:
                 base = sym.split("/")[0]
-            except Exception:
-                continue
-            vol = float(info.get("quoteVolume") or info.get("quoteVolume24h") or 0)
-            candidates.append((base, vol))
-        candidates = sorted(candidates, key=lambda x: x[1], reverse=True)
-        symbols = [c[0] for c in candidates][:limit]
-        if not symbols:
-            return ["BTC","ETH","SOL","BNB"][:limit]
-        return symbols
-    except Exception as e:
-        logging.warning("get_top_symbols_by_volume failed: %s", e)
-        return ["BTC","ETH","SOL","BNB"][:limit]
+            else:
+                base = sym.replace("USDT:USDT", "").replace("USDT", "").replace(":USDT", "")
+            res.append(base)
+            if len(res) >= limit:
+                break
+        if not res:
+            # fallback static
+            res = ["BTC","ETH","SOL","BNB","XRP","ADA","DOGE","DOT","AVAX","MATIC"][:limit]
+        return list(dict.fromkeys([s.upper() for s in res]))  # unique preserve order
+    except Exception:
+        return ["BTC","ETH","SOL","BNB","XRP","ADA","DOGE","DOT","AVAX","MATIC"][:limit]
 
-def fetch_ohlcv_ccxt(symbol: str, timeframe: str = "1d", since: int = None, limit: int = 200):
-    if not exchange:
-        return []
-    market_sym = f"{symbol}/USDT:USDT"
+def symbol_market_ccxt(symbol: str) -> str:
+    return f"{symbol}/USDT:USDT"
+
+# OHLCV fetch via ccxt for futures/swap
+def fetch_ohlcv(symbol: str, timeframe: str = "1m", limit: int = 1000) -> List[List[Any]]:
+    market_sym = symbol_market_ccxt(symbol)
     try:
-        data = exchange.fetch_ohlcv(market_sym, timeframe=timeframe, since=since, limit=limit)
-        # convert to list of dicts
-        ohlcv = []
-        for row in data:
-            ts, o, h, l, c, v = row[0], row[1], row[2], row[3], row[4], row[5]
-            ohlcv.append({"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v})
+        # ccxt expects timeframe like '1m','1h','1d'
+        ohlcv = ccxt_client.fetch_ohlcv(market_sym, timeframe=timeframe, limit=limit)
         return ohlcv
     except Exception as e:
-        logging.debug("fetch_ohlcv_ccxt failed for %s: %s", symbol, e)
+        logging.debug("fetch_ohlcv failed %s %s", symbol, e)
         return []
 
-def fetch_orderbook_ccxt(symbol: str, limit: int = 50):
-    if not exchange:
-        return {"bids": [], "asks": [], "bid_vol": 0.0, "ask_vol": 0.0}
-    sym = f"{symbol}/USDT:USDT"
+def calc_atr_from_ohlcv(ohlcv: List[List[Any]], period: int = ATR_PERIOD) -> float:
+    # ohlcv rows: [ts, open, high, low, close, volume]
+    if not ohlcv or len(ohlcv) < period + 1:
+        return 0.0
+    highs = np.array([r[2] for r in ohlcv])
+    lows = np.array([r[3] for r in ohlcv])
+    closes = np.array([r[4] for r in ohlcv])
+    trs = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])))
+    atr = np.mean(trs[-period:])
+    return float(atr)
+
+def fetch_orderbook(symbol: str, depth: int = 50) -> Dict[str, Any]:
+    market_sym = symbol_market_ccxt(symbol)
     try:
-        ob = exchange.fetch_order_book(sym, limit=limit)
-        bids = [(float(p), float(q)) for p,q in ob.get("bids", [])]
-        asks = [(float(p), float(q)) for p,q in ob.get("asks", [])]
-        bid_vol = sum(q for _, q in bids)
-        ask_vol = sum(q for _, q in asks)
+        ob = ccxt_client.fetch_order_book(market_sym, limit=depth)
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+        bid_vol = sum([b[1] for b in bids])
+        ask_vol = sum([a[1] for a in asks])
         return {"bids": bids, "asks": asks, "bid_vol": bid_vol, "ask_vol": ask_vol}
     except Exception as e:
-        logging.debug("fetch_orderbook_ccxt failed for %s: %s", symbol, e)
+        logging.debug("fetch_orderbook failed %s", e)
         return {"bids": [], "asks": [], "bid_vol": 0.0, "ask_vol": 0.0}
 
-def calc_atr_from_ohlcv_list(ohlcv: List[Dict[str,Any]], period: int = ATR_PERIOD):
-    if not ohlcv or len(ohlcv) < period+1:
-        return None
-    trs = []
-    for i in range(1, len(ohlcv)):
-        high = ohlcv[i]["high"]
-        low = ohlcv[i]["low"]
-        prev = ohlcv[i-1]["close"]
-        tr = max(high-low, abs(high-prev), abs(low-prev))
-        trs.append(tr)
-    if len(trs) < period:
-        return None
-    atr = sum(trs[-period:]) / period
-    return atr
-
-def generate_ai_comment(symbol: str, price: float, atr: float, ob: Dict[str,Any], fg: Dict[str,Any]) -> str:
-    """
-    Rule-based layered comment that reads like AI summary.
-    """
+# AI-style comment generation (rule-based multi-layer)
+def generate_ai_comment(symbol: str, price: float, atr: float, ob: Dict[str,Any], fg: Dict[str,Any], ohlcv_recent) -> str:
     parts = []
-    # Market psychology
+    # Fear & greed
     fg_val = fg.get("value")
-    fg_cls = fg.get("value_classification")
-    parts.append(f"市場心理: {fg_cls} (Fear&Greed: {fg_val})")
+    fg_label = fg.get("value_classification", "Unknown")
+    parts.append(f"市場心理: {fg_label} ({fg_val})")
 
     # ATR
-    if atr:
-        ratio = atr / price if price else 0
-        if ratio > 0.06:
-            parts.append(f"ボラティリティ: 高い (ATR={atr:.4f}) — 急激な値動きに注意。")
+    if atr and price:
+        ratio = atr / max(1e-9, price)
+        if ratio > 0.05:
+            parts.append(f"ボラティリティ: 高い (ATR={atr:.4f}, price={price:.4f})")
         elif ratio < 0.02:
-            parts.append(f"ボラティリティ: 低め (ATR={atr:.4f}) — レンジ継続の可能性。")
+            parts.append(f"ボラティリティ: 低い (ATR={atr:.4f})")
         else:
-            parts.append(f"ボラティリティ: 中程度 (ATR={atr:.4f}).")
+            parts.append(f"ボラティリティ: 中程度 (ATR={atr:.4f})")
     else:
-        parts.append("ATR: データ不足。")
+        parts.append("ATRデータ不足")
 
-    # Orderbook
+    # orderbook thickness
     bid_vol = ob.get("bid_vol", 0.0)
     ask_vol = ob.get("ask_vol", 0.0)
-    if bid_vol and ask_vol:
-        if bid_vol > ask_vol * 1.5:
-            parts.append(f"板: 買いが厚い (buy {bid_vol:.2f} vs sell {ask_vol:.2f}) — 下支え期待。")
-        elif ask_vol > bid_vol * 1.5:
-            parts.append(f"板: 売りが厚い (sell {ask_vol:.2f} vs buy {bid_vol:.2f}) — 売圧注意。")
-        else:
-            parts.append(f"板: 拮抗 (buy {bid_vol:.2f} / sell {ask_vol:.2f}).")
+    if bid_vol > ask_vol * 1.5:
+        parts.append(f"板: 買い厚め (buy={bid_vol:.1f} / sell={ask_vol:.1f}) — 下支えあり")
+    elif ask_vol > bid_vol * 1.5:
+        parts.append(f"板: 売り厚め (buy={bid_vol:.1f} / sell={ask_vol:.1f}) — 売圧注意")
     else:
-        parts.append("板: データ不足。")
+        parts.append(f"板: 拮抗 (buy={bid_vol:.1f} / sell={ask_vol:.1f})")
 
-    # Trend via SMA
-    ohlcv = fetch_ohlcv_ccxt(symbol, timeframe="1d", limit=30)
-    if len(ohlcv) >= 25:
-        closes = [x["close"] for x in ohlcv]
-        sma7 = sum(closes[-7:]) / 7
-        sma25 = sum(closes[-25:]) / 25
-        if sma7 > sma25:
-            parts.append("短期トレンド: 上向き📈")
-        elif sma7 < sma25:
-            parts.append("短期トレンド: 下向き📉")
-        else:
-            parts.append("短期トレンド: 横ばい。")
-    else:
-        parts.append("チャート: データ不足。")
-
-    # Score aggregation
-    score = 50.0
-    # ATR contribution
-    if atr:
-        if ratio > 0.06: score -= 5
-        elif ratio < 0.02: score += 3
-    # orderbook contribution
-    if bid_vol and ask_vol:
-        if bid_vol > ask_vol * 1.5: score += 5
-        elif ask_vol > bid_vol * 1.5: score -= 5
-    # Fear greed
+    # simple trend on recent closes
     try:
-        fgv = int(fg_val) if fg_val and str(fg_val).isdigit() else 50
-        if fgv > 70:
-            score -= 5
-        elif fgv < 30:
-            score += 3
+        closes = [r[4] for r in ohlcv_recent[-50:]] if ohlcv_recent else []
+        if len(closes) >= 10:
+            sma5 = np.mean(closes[-5:])
+            sma20 = np.mean(closes[-20:]) if len(closes)>=20 else np.mean(closes)
+            if sma5 > sma20:
+                parts.append("短期トレンド: 上昇基調 📈")
+            elif sma5 < sma20:
+                parts.append("短期トレンド: 下落基調 📉")
+            else:
+                parts.append("短期トレンド: 横ばい")
+        else:
+            parts.append("チャートデータ不足")
     except Exception:
-        pass
+        parts.append("チャート分析エラー")
 
-    parts.append(f"総合スコア (0-100): {min(max(round(score,1),0),100)}")
+    # Score synthesis (simple weighted)
+    score = 50.0
+    if fg_val and str(fg_val).isdigit():
+        v = int(fg_val)
+        # higher FG -> more risk for longs
+        score += (50 - v) * -0.2  # if FG high reduce score slightly
+    # ATR effect
+    if atr and price:
+        r = atr / max(1e-9, price)
+        if r < 0.02:
+            score += 5
+        elif r > 0.05:
+            score -= 5
+    # orderbook effect
+    if bid_vol > ask_vol * 1.5:
+        score += 5
+    elif ask_vol > bid_vol * 1.5:
+        score -= 5
+    # normalize
+    score = max(0, min(100, score))
+    parts.append(f"総合スコア: {score:.1f}/100")
 
-    return "\n".join(parts), score
+    return ("\n".join(parts), score)
 
-# -----------------------------
-# Signal & Execution
-# -----------------------------
-def evaluate_and_maybe_trade(symbol: str, price: float, atr: float, ob: Dict[str,Any], fg: Dict[str,Any]):
+# ---------------- Backtester (simple) ----------------
+def run_backtest_for_symbol(symbol: str, timeframe: str = "1h", lookback: int = 1000,
+                            atr_period: int = ATR_PERIOD, tp_mult: float = TP_ATR_MULT, sl_mult: float = SL_ATR_MULT,
+                            position_usd: float = POSITION_USD) -> Dict[str,Any]:
     """
-    Decide whether to open positions based on rule, backtest filter, and execute using executor (paper or real).
+    Simple backtest: run through OHLCV series, if 1h price change > threshold open long/short,
+    TP/SL by ATR. This is a simplified event-driven sim (no slippage by default, but we will include slippage & fee factors).
+    Returns metrics (win_rate, pf, sharpe, trades, balance_curve).
     """
-    # simple price momentum rule: 1d change
-    ohlcv_2 = fetch_ohlcv_ccxt(symbol, timeframe="1d", limit=2)
-    if len(ohlcv_2) < 2:
-        logging.debug("skip %s: not enough 1d data", symbol)
-        return None
+    ohlcv = fetch_ohlcv(symbol, timeframe=timeframe, limit=lookback+50)
+    if not ohlcv or len(ohlcv) < 50:
+        return {"error":"no_ohlcv"}
+    # convert to DataFrame
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+    df["ts"] = pd.to_datetime(df["ts"], unit='ms', utc=True).dt.tz_convert(JST)
+    # compute ATR
+    highs = df["high"].values
+    lows = df["low"].values
+    closes = df["close"].values
+    trs = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])))
+    atrs = pd.Series(np.concatenate([np.zeros(1), trs])).rolling(atr_period).mean().fillna(method="bfill").values
 
-    today_close = ohlcv_2[-1]["close"]
-    prev_close = ohlcv_2[-2]["close"]
-    change_pct = (today_close / prev_close - 1.0) * 100.0
-    threshold = float(os.getenv("PRICE_CHANGE_THRESHOLD_PCT", "5.0"))
+    balance = 10000.0
+    balance_curve = []
+    trades = []
 
-    # build candidate trade dict
-    candidate = None
-    if change_pct >= threshold:
-        # candidate long
-        tp = today_close + TP_ATR_MULT * (atr or 0)
-        sl = today_close - SL_ATR_MULT * (atr or 0)
-        candidate = {"symbol": symbol, "side": "long", "entry_price": price, "tp": tp, "sl": sl, "signal_strength": change_pct}
-    elif change_pct <= -threshold:
-        tp = today_close - TP_ATR_MULT * (atr or 0)
-        sl = today_close + SL_ATR_MULT * (atr or 0)
-        candidate = {"symbol": symbol, "side": "short", "entry_price": price, "tp": tp, "sl": sl, "signal_strength": change_pct}
+    fee_rate = float(os.getenv("BACKTEST_FEE_RATE", "0.0005"))  # 0.05% per side
+    slippage = float(os.getenv("BACKTEST_SLIPPAGE", "0.0005"))
 
-    if not candidate:
-        return None
-
-    # run backtest filter: fetch historical ohlcv for this symbol and run backtester with same rule
-    hist = fetch_ohlcv_ccxt(symbol, timeframe="1d", limit=1200)  # fetch enough history
-    if not hist or len(hist) < 50:
-        logging.debug("backtest skip for %s: insufficient history", symbol)
-        # allow trade if ATR and ob ok? For safety, skip trade if no history
-        return None
-
-    rule = {
-        "price_change_threshold_pct": abs(candidate["signal_strength"]),
-        "atr_period": ATR_PERIOD,
-        "tp_atr_mult": TP_ATR_MULT,
-        "sl_atr_mult": SL_ATR_MULT
+    for i in range(atr_period+1, len(df)-1):
+        close_now = float(df["close"].iloc[i])
+        close_prev = float(df["close"].iloc[i-1])
+        pct_change = (close_now / close_prev - 1.0) * 100.0
+        atr = float(atrs[i])
+        # signal rules: momentum
+        entry_side = None
+        if pct_change > float(os.getenv("BACKTEST_ENTRY_PCT", "5.0")):
+            entry_side = "long"
+        elif pct_change < -float(os.getenv("BACKTEST_ENTRY_PCT", "5.0")):
+            entry_side = "short"
+        if entry_side:
+            entry_price = close_now * (1 + slippage if entry_side=="long" else 1 - slippage)
+            tp = entry_price + (tp_mult * atr if entry_side=="long" else -tp_mult * atr)
+            sl = entry_price - (sl_mult * atr if entry_side=="long" else -sl_mult * atr)
+            # simulate until TP/SL or max horizon 48 bars
+            exit_price = None
+            exit_index = None
+            reason = "HOLD"
+            for j in range(i+1, min(len(df), i+48)):
+                high = float(df["high"].iloc[j])
+                low = float(df["low"].iloc[j])
+                if entry_side == "long":
+                    # TP
+                    if high >= tp:
+                        exit_price = tp * (1 - slippage)
+                        exit_index = j
+                        reason = "TP"
+                        break
+                    if low <= sl:
+                        exit_price = sl * (1 + slippage)
+                        exit_index = j
+                        reason = "SL"
+                        break
+                else:
+                    if low <= tp:
+                        exit_price = tp * (1 + slippage)
+                        exit_index = j
+                        reason = "TP"
+                        break
+                    if high >= sl:
+                        exit_price = sl * (1 - slippage)
+                        exit_index = j
+                        reason = "SL"
+                        break
+            if exit_price is None:
+                # exit at next bar close
+                exit_price = float(df["close"].iloc[min(i+1, len(df)-1)])
+                reason = "TIMEOUT"
+            # compute pnl per contract: for linear futures, amount = USD / entry_price
+            amount = position_usd / entry_price
+            if entry_side == "long":
+                pnl = (exit_price - entry_price) * amount
+            else:
+                pnl = (entry_price - exit_price) * amount
+            # subtract fees both sides
+            fees = (entry_price * amount + exit_price * amount) * fee_rate
+            pnl_net = pnl - fees
+            balance += pnl_net
+            trades.append({"symbol": symbol, "side": entry_side, "entry": entry_price, "exit": exit_price, "pnl": pnl_net, "reason": reason})
+            balance_curve.append(balance)
+            # move i to exit_index roughly to avoid overlapping signals (conservative)
+            if exit_index:
+                i = exit_index
+    # metrics
+    pnls = np.array([t["pnl"] for t in trades]) if trades else np.array([])
+    win_rate = float((pnls > 0).sum()) / len(pnls) * 100 if pnls.size else 0.0
+    gross_profit = pnls[pnls>0].sum() if pnls.size else 0.0
+    gross_loss = -pnls[pnls<0].sum() if pnls.size else 0.0
+    pf = (gross_profit / gross_loss) if gross_loss>0 else float("inf") if gross_profit>0 else 0.0
+    sharpe = (pnls.mean() / (pnls.std()+1e-9) * np.sqrt(252)) if pnls.size>1 else 0.0
+    dd = 0.0
+    if balance_curve:
+        arr = np.array(balance_curve)
+        peak = np.maximum.accumulate(arr)
+        dd = float(((arr - peak)/peak).min() * 100)
+    return {
+        "symbol": symbol,
+        "trades": trades,
+        "balance_curve": balance_curve,
+        "win_rate": win_rate,
+        "profit_factor": pf,
+        "sharpe": sharpe,
+        "max_drawdown_pct": dd,
+        "n_trades": len(trades)
     }
-    bt_result = backtester.run_rule_backtest(hist, rule, max_trades=BACKTEST_TRADES)
-    # Filter: simple threshold rule for pf and winrate
-    pf = bt_result.get("profit_factor") or 0
-    wr = bt_result.get("win_rate") or 0
-    sharpe = bt_result.get("sharpe") or 0
-    # Heuristics: require PF>1 and winrate>40 or sharpe>0.5
-    allow = False
-    if (pf is None):
-        allow = False
-    else:
-        if (pf >= 1.0 and wr >= 40) or (sharpe and sharpe > 0.5):
-            allow = True
 
-    # Compose AI comment and score
-    ai_comment, score = generate_ai_comment(symbol, price, atr, ob, fg)
-
-    # If allowed -> execute simulated order sizing
-    if allow:
-        size_usd = POSITION_SIZE_USD
-        # dynamic adjustment: if backtest suggests higher PF, can increase size by factor (capped)
-        if pf and pf > 1.5:
-            size_usd *= min(1.5, 1 + (pf - 1))
-        # check balance
-        balance = state.get_balance()
-        # simple risk cap: don't allocate more than 10% of balance to one position
-        size_usd = min(size_usd, balance * 0.1)
-
-        # Enter position (paper or live)
-        rec = executor.open_position(symbol, candidate["side"], size_usd,
-                                     entry_price=price, take_profit=candidate["tp"], stop_loss=candidate["sl"],
-                                     leverage=3.0, partial_steps=[0.5,0.25,0.25])
-        # Notify
-        msg = (
-            f"<b>📥 New Position</b>\n"
-            f"<b>{symbol}</b> {candidate['side'].upper()} (Sim:{PAPER_TRADING})\n"
-            f"Entry: <code>{price:.6f}</code>\n"
-            f"Size(USD): <code>{size_usd:.2f}</code>\n"
-            f"TP: <code>{candidate['tp']:.6f}</code>  SL: <code>{candidate['sl']:.6f}</code>\n"
-            f"Backtest PF: <code>{pf:.3f}</code> WinRate: <code>{wr:.2f}%</code> Sharpe: <code>{sharpe}</code>\n"
-            f"<pre>{ai_comment}</pre>\n"
-        )
-        send_telegram_html(msg)
-        logging.info("Opened candidate %s %s", symbol, candidate['side'])
-        # return details
-        return {"executed": True, "symbol": symbol, "pf": pf, "win_rate": wr, "sharpe": sharpe}
-    else:
-        logging.debug("Candidate filtered out by backtest: %s pf=%s wr=%s", symbol, pf, wr)
-        return {"executed": False, "pf": pf, "win_rate": wr}
-
-# -----------------------------
-# Cycle logic
-# -----------------------------
+# --------------- Main trading cycle ----------------
 def run_cycle():
-    logging.info("=== cycle start === %s", datetime.now(JST).isoformat())
-    symbols = get_top_symbols_by_volume(MONITORED_COUNT)
-    logging.info("Monitoring %d symbols", len(symbols))
+    logging.info("=== cycle start === %s", utcnow_jst_iso())
     fg = fetch_fear_and_greed()
-    snapshot = {"timestamp": datetime.now(JST).isoformat(), "symbols": {}}
+    top_symbols = fetch_top_symbols(MONITORED_TOP_N)
+    snapshot = {"timestamp": utcnow_jst_iso(), "symbols": {}}
 
-    for sym in symbols:
+    # Run backtester for each symbol (but lightweight: maybe limit or cache in prod)
+    backtest_cache = {}
+    for sym in top_symbols:
+        try:
+            bt = run_backtest_for_symbol(sym, timeframe="1h", lookback=1000)
+            backtest_cache[sym] = bt
+        except Exception as e:
+            backtest_cache[sym] = {"error": str(e)}
+
+    for sym in top_symbols:
         try:
             price = None
             try:
-                ticker = exchange.fetch_ticker(f"{sym}/USDT:USDT")
-                price = float(ticker.get("last") or ticker.get("close") or 0)
+                ticker = ccxt_client.fetch_ticker(symbol_market_ccxt(sym))
+                price = ticker.get("last") or ticker.get("close")
             except Exception:
-                # fallback to ohlcv last close
-                hist = fetch_ohlcv_ccxt(sym, timeframe="1m", limit=3)
-                if hist:
-                    price = float(hist[-1]["close"])
-            if not price or price == 0:
-                logging.debug("skip %s: price not found", sym)
+                # fallback to OHLCV last close
+                o = fetch_ohlcv(sym, timeframe="1m", limit=2)
+                if o:
+                    price = o[-1][4]
+            if price is None:
+                logging.debug("%s price missing", sym)
                 continue
 
-            ohlcv_daily = fetch_ohlcv_ccxt(sym, timeframe="1d", limit=ATR_PERIOD+5)
-            atr = calc_atr_from_ohlcv_list(ohlcv_daily, period=ATR_PERIOD) if ohlcv_daily else None
-            ob = fetch_orderbook_ccxt(sym, limit=50)
-            ai_comment, score = generate_ai_comment(sym, price, atr, ob, fg)
-
-            snapshot["symbols"][sym] = {
-                "price": price,
-                "atr": atr,
-                "orderbook": {"bid_vol": ob.get("bid_vol"), "ask_vol": ob.get("ask_vol")},
-                "score": score,
-                "ai_comment": ai_comment
-            }
-
-            # Evaluate candidate & possibly trade
-            evaluate_and_maybe_trade(sym, price, atr, ob, fg)
-
+            ohlcv_m = fetch_ohlcv(sym, timeframe="1m", limit=200)
+            atr = calc_atr_from_ohlcv(fetch_ohlcv(sym, timeframe="1d", limit=ATR_PERIOD+5), period=ATR_PERIOD)
+            ob = fetch_orderbook(sym, depth=50)
+            comment, score = generate_ai_comment(sym, price, atr, ob, fg, ohlcv_m)
+            snapshot["symbols"][sym] = {"price": price, "atr": atr, "orderbook": {"bid_vol": ob["bid_vol"], "ask_vol": ob["ask_vol"]}, "score": score, "ai": comment}
+            # Decision logic: use score & backtest filter
+            bt = backtest_cache.get(sym, {})
+            pass_filter = True
+            # Example filter: require bt n_trades>=20 and win_rate>40 and sharpe>0.5
+            if isinstance(bt, dict) and bt.get("n_trades", 0) >= 20:
+                if bt.get("win_rate", 0) < 40 or bt.get("sharpe", 0) < 0.2:
+                    pass_filter = False
+            # Signal rule: if score>60 and recent 1m momentum positive -> LONG, if score<40 negative -> SHORT
+            # compute 1m momentum
+            signal = None
+            if len(ohlcv_m) >= 2:
+                last = ohlcv_m[-1][4]
+                prev = ohlcv_m[-2][4]
+                pct = (last/prev -1.0) * 100
+                if score >= 60 and pct > 0.2 and pass_filter:
+                    signal = "long"
+                elif score <= 40 and pct < -0.2 and pass_filter:
+                    signal = "short"
+            # Execute simulated entry (paper) or live if configured
+            if signal and not state.has_position(sym):
+                tp = last + TP_ATR_MULT * atr if signal == "long" else last - TP_ATR_MULT * atr
+                sl = last - SL_ATR_MULT * atr if signal == "long" else last + SL_ATR_MULT * atr
+                size_usd = POSITION_USD
+                # check balance & sizing
+                balance = state.get_balance()
+                if size_usd > balance * 0.2:
+                    # don't allocate more than 20% of balance
+                    size_usd = balance * 0.2
+                # run backtester quick check: if bt shows PF>1 prefer entry
+                if bt and isinstance(bt, dict) and bt.get("profit_factor", 0) > 0:
+                    bt_pf = bt.get("profit_factor", 0)
+                    if bt_pf < 0.5:
+                        logging.info("Skipping %s due to weak backtest pf=%.2f", sym, bt_pf)
+                        continue
+                # open position via executor
+                res = executor.open_position(sym, signal, size_usd, last, tp, sl, leverage=int(os.getenv("DEFAULT_LEVERAGE","3")))
+                # send telegram
+                msg = f"<b>📥 新規ポジション {'(SIM)' if res.get('simulated') else ''}</b>\n"
+                msg += f"<b>{sym}</b> {signal.upper()} @ <code>{last:.6f}</code>\n"
+                msg += f"Size(USDT): <code>{size_usd:.2f}</code>  Size(asset): <code>{res.get('amount', 0):.6f}</code>\n"
+                msg += f"TP: <code>{tp:.6f}</code>  SL: <code>{sl:.6f}</code>\n"
+                msg += "<pre>" + comment + "</pre>"
+                send_telegram_html(msg)
         except Exception as e:
-            logging.exception("Error processing %s: %s", sym, e)
-        time.sleep(0.15)  # gentle pacing
+            logging.exception("symbol processing failed %s: %s", sym, e)
+        time.sleep(0.05)
 
-    # update last snapshot for status
+    # persist snapshot
     state.update_last_snapshot(snapshot)
-    logging.info("=== cycle finished === %s", datetime.now(JST).isoformat())
+    logging.info("=== cycle finished === %s", utcnow_jst_iso())
 
-# -----------------------------
-# Periodic reports and position checks
-# -----------------------------
+# ---------------- position checker for TP/SL (runs each minute) ----------------
 def check_positions_and_manage():
-    # examine each open position for TP/SL reached (price based)
+    logging.info("=== check positions ===")
     positions = state.get_positions()
-    fg = fetch_fear_and_greed()
     for sym, pos in list(positions.items()):
         try:
             price = None
             try:
-                ticker = exchange.fetch_ticker(f"{sym}/USDT:USDT")
-                price = float(ticker.get("last") or ticker.get("close") or 0)
+                t = ccxt_client.fetch_ticker(symbol_market_ccxt(sym))
+                price = t.get("last") or t.get("close")
             except Exception:
+                o = fetch_ohlcv(sym, timeframe="1m", limit=2)
+                if o:
+                    price = o[-1][4]
+            if price is None:
                 continue
             side = pos["side"]
             tp = float(pos["take_profit"])
             sl = float(pos["stop_loss"])
-            # multi-step partial close logic example:
-            # if TP reached do partial close according to stored plan (for simplicity, close all)
+            # handle multi-step partial closes: for simplicity close full when reach TP/SL
             if side == "long":
                 if price >= tp:
-                    rec = state.close_position(sym, price, reason="TP")
-                    send_telegram_html(f"<b>✅ TP reached</b>\n<b>{sym}</b>\nEntry:{rec['entry_price']:.6f}\nExit:{rec['exit_price']:.6f}\nPnL:{rec['pnl']:.6f}\n")
-                elif price <= sl:
-                    rec = state.close_position(sym, price, reason="SL")
-                    send_telegram_html(f"<b>❌ SL triggered</b>\n<b>{sym}</b>\nEntry:{rec['entry_price']:.6f}\nExit:{rec['exit_price']:.6f}\nPnL:{rec['pnl']:.6f}\n")
+                    rec = executor.close_position(sym, portion=1.0)
+                    msg = f"<b>✅ TP executed</b>\n<b>{sym}</b>\nExit: <code>{price:.6f}</code>\nPnL: <code>{rec.get('pnl',0):.4f}</code>"
+                    send_telegram_html(msg)
             else:
                 if price <= tp:
-                    rec = state.close_position(sym, price, reason="TP")
-                    send_telegram_html(f"<b>✅ TP reached (SHORT)</b>\n<b>{sym}</b>\nPnL:{rec['pnl']:.6f}\n")
-                elif price >= sl:
-                    rec = state.close_position(sym, price, reason="SL")
-                    send_telegram_html(f"<b>❌ SL triggered (SHORT)</b>\n<b>{sym}</b>\nPnL:{rec['pnl']:.6f}\n")
+                    rec = executor.close_position(sym, portion=1.0)
+                    msg = f"<b>✅ TP executed</b>\n<b>{sym}</b>\nExit: <code>{price:.6f}</code>\nPnL: <code>{rec.get('pnl',0):.4f}</code>"
+                    send_telegram_html(msg)
+            # stoploss
+            if side == "long" and price <= sl:
+                rec = executor.close_position(sym, portion=1.0)
+                msg = f"<b>❌ SL executed</b>\n<b>{sym}</b>\nExit: <code>{price:.6f}</code>\nPnL: <code>{rec.get('pnl',0):.4f}</code>"
+                send_telegram_html(msg)
+            if side == "short" and price >= sl:
+                rec = executor.close_position(sym, portion=1.0)
+                msg = f"<b>❌ SL executed</b>\n<b>{sym}</b>\nExit: <code>{price:.6f}</code>\nPnL: <code>{rec.get('pnl',0):.4f}</code>"
+                send_telegram_html(msg)
         except Exception as e:
-            logging.exception("check positions failed for %s: %s", sym, e)
+            logging.exception("check pos failed %s: %s", sym, e)
 
-def hourly_report():
-    # build human-friendly status
-    bal = state.get_balance()
-    stats = state.get_stats()
-    positions = state.get_positions()
-    fg = fetch_fear_and_greed()
-    msg = (
-        f"<b>🕒 Hourly Report ({datetime.now(JST).strftime('%Y-%m-%d %H:%M JST')})</b>\n"
-        f"<b>Balance:</b> <code>{bal:.2f} USDT</code>\n"
-        f"<b>WinRate:</b> <code>{stats.get('win_rate', 0.0):.2f}%</code>\n"
-        f"<b>Positions:</b> <code>{len(positions)}</code>\n\n"
-    )
-    if positions:
-        for sym, p in positions.items():
-            msg += (f"<b>{sym}</b> {p['side'].upper()} Entry:<code>{p['entry_price']:.6f}</code> "
-                    f"TP:<code>{p['take_profit']:.6f}</code> SL:<code>{p['stop_loss']:.6f}</code>\n")
-    else:
-        msg += "No open positions.\n"
-    msg += f"\nFear&Greed: {fg.get('value')} ({fg.get('value_classification')})"
-    send_telegram_html(msg)
-
-# -----------------------------
-# Scheduler
-# -----------------------------
-def scheduler_loop():
-    schedule.every(CYCLE_MINUTES).minutes.do(run_cycle)
-    schedule.every(CYCLE_MINUTES).minutes.do(check_positions_and_manage)
-    # hourly report at JST top-of-hour
-    while True:
-        schedule.run_pending()
-        # fire hourly at top of JST hour
-        now = datetime.now(timezone.utc).astimezone(JST)
-        if now.minute == 0 and now.second < 5:
-            try:
-                hourly_report()
-                time.sleep(61)
-            except Exception as e:
-                logging.exception("hourly_report error: %s", e)
-        time.sleep(1)
-
-# -----------------------------
-# Flask status endpoint
-# -----------------------------
-from flask import Flask, request, jsonify
-app = Flask(__name__)
-
-@app.route("/")
-def hello():
-    return "Trend Sentinel (Bitget Futures) - monitoring"
-
+# ---------------- Scheduler & Flask status ----------------
 @app.route("/status")
 def status():
     key = request.args.get("key", "")
     if key != STATUS_KEY:
         return jsonify({"error": "unauthorized"}), 401
     snap = state.get_state_snapshot()
-    snap["server_time_jst"] = datetime.now(JST).isoformat()
+    snap["server_time_jst"] = utcnow_jst_iso()
     snap["paper_trading"] = PAPER_TRADING
+    snap["monitored"] = fetch_top_symbols(MONITORED_TOP_N)
+    snap["telegram_configured"] = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+    snap["executor_ok"] = (executor.exchange is not None)
     return jsonify(snap)
 
-# -----------------------------
-# Entrypoint
-# -----------------------------
+def start_scheduler():
+    # trading cycle every 1 minute
+    schedule.every(1).minutes.do(run_cycle)
+    # check positions every 1 minute
+    schedule.every(1).minutes.do(check_positions_and_manage)
+    # hourly report at JST minute==0
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
 if __name__ == "__main__":
     logging.info("Starting Trend Sentinel (Bitget Futures). PAPER_TRADING=%s", PAPER_TRADING)
-    t = threading.Thread(target=scheduler_loop, daemon=True)
+    t = threading.Thread(target=start_scheduler, daemon=True)
     t.start()
-    # run initial cycle immediately
-    try:
-        run_cycle()
-    except Exception as e:
-        logging.exception("initial run failed: %s", e)
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
