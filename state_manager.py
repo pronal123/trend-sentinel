@@ -7,15 +7,6 @@ logger = logging.getLogger(__name__)
 
 
 class StateManager:
-    """
-    Trend Sentinel - State Manager
-    ・トレード履歴管理
-    ・残高管理
-    ・ポジション状態管理
-    ・統計値計算（WinRate, ProfitFactor, Sharpe, DDなど）
-    ・AI風コメント生成
-    """
-
     def __init__(self, initial_balance: float = 10000.0):
         self.balance = initial_balance
         self.initial_balance = initial_balance
@@ -119,10 +110,8 @@ class StateManager:
     def generate_ai_comment(self, symbol: str, orderbook: Dict[str, Any],
                             ticker: Dict[str, Any], atr: float,
                             fear_greed: str = "Unknown") -> str:
-        """AI風コメントを返す（板厚・ATR・市場心理・チャート分析など）"""
         bid_depth = sum([b[1] for b in orderbook.get("bids", [])[:5]]) if orderbook else 0
         ask_depth = sum([a[1] for a in orderbook.get("asks", [])[:5]]) if orderbook else 0
-
         imbalance = "Buyers strong" if bid_depth > ask_depth else "Sellers strong"
 
         comment = (
@@ -150,5 +139,19 @@ class StateManager:
             score += 1
         if sharpe > 1.0:
             score += 1
-
         return score
+
+    # =========================================================
+    # まとめて統計返却
+    # =========================================================
+    def get_stats(self, lookback: int = 1000) -> Dict[str, Any]:
+        return {
+            "balance": self.get_balance(),
+            "positions": self.get_positions(),
+            "trade_count": len(self.trade_history),
+            "win_rate": self.get_win_rate(lookback),
+            "profit_factor": self.get_profit_factor(lookback),
+            "sharpe": self.get_sharpe_ratio(lookback),
+            "max_drawdown": self.get_max_drawdown(lookback),
+            "composite_score": self.get_composite_score(lookback),
+        }
