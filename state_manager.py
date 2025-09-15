@@ -1,13 +1,13 @@
 import logging
 import statistics
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from datetime import datetime
 
 
 class StateManager:
     """
-    トレード状態・ポジション・残高を管理するクラス。
-    部分利確・トレーリング・勝率統計をサポート。
+    トレード状態・ポジション・残高を管理
+    部分利確・トレーリング・勝率統計をサポート
     """
 
     def __init__(self, starting_balance: float = 1000.0):
@@ -16,7 +16,7 @@ class StateManager:
         self.trade_history: List[Dict[str, Any]] = []
         self.realized_pnl = 0.0
 
-    # ========== balance ==========
+    # ===== Balance =====
     def get_balance(self) -> float:
         return self.balance
 
@@ -24,7 +24,7 @@ class StateManager:
         self.balance += delta
         logging.info(f"Balance updated: {self.balance:.2f} USDT")
 
-    # ========== positions ==========
+    # ===== Position =====
     def has_position(self, symbol: str) -> bool:
         return symbol in self.positions
 
@@ -40,7 +40,7 @@ class StateManager:
             "leverage": leverage,
             "opened_at": datetime.utcnow().isoformat(),
         }
-        logging.info(f"OPEN {side} {symbol} entry={entry_price:.4f} tp={tp:.4f} sl={sl:.4f}")
+        logging.info(f"OPEN {side.upper()} {symbol} entry={entry_price:.4f} tp={tp:.4f} sl={sl:.4f}")
 
     def close_position(self, symbol: str, exit_price: float,
                        reason: str = "", portion: float = 1.0) -> Dict[str, Any]:
@@ -90,7 +90,7 @@ class StateManager:
             if new_sl < pos["stop_loss"]:
                 pos["stop_loss"] = new_sl
 
-    # ========== stats ==========
+    # ===== Stats =====
     def get_win_rate(self) -> float:
         if not self.trade_history:
             return 0.0
