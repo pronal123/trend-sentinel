@@ -1,7 +1,7 @@
 import logging
 import math
 import os
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 import ccxt
 from state_manager import StateManager
@@ -14,8 +14,7 @@ BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE_FUTURES")
 
 class TradingExecutor:
     """
-    Bitget Futures 注文実行。
-    PaperTrading時は StateManager に記録のみ。
+    Bitget Futures 注文実行（Paper / Live切替）
     """
 
     def __init__(self, state_manager: StateManager):
@@ -73,7 +72,8 @@ class TradingExecutor:
             logging.exception("Failed to open position: %s", e)
             return {"error": str(e)}
 
-    def close_position(self, symbol: str, portion: float = 1.0) -> Dict[str, Any]:
+    def close_position(self, symbol: str, exit_price: float = None,
+                       portion: float = 1.0) -> Dict[str, Any]:
         if not self.state.has_position(symbol):
             return {"error": "no position"}
         pos = self.state.positions[symbol]
@@ -82,7 +82,7 @@ class TradingExecutor:
         market_symbol = self._market_symbol(symbol)
 
         if PAPER_TRADING or not self.exchange:
-            price = pos["entry_price"]
+            price = exit_price or pos["entry_price"]
             rec = self.state.close_position(symbol, price, portion=portion, reason="PAPER")
             return {"simulated": True, "pnl": rec["pnl"]}
 
