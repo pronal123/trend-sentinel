@@ -1,103 +1,103 @@
-import os
-import time
-import hmac
-import hashlib
-import requests
+# trading_executor.py
 import logging
-from state_manager import StateManager
+import ccxt
+import time
+from typing import Optional, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 class TradingExecutor:
-    def __init__(self, api_key, api_secret, passphrase, symbol="BTCUSDT_UMCBL"):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.passphrase = passphrase
-        self.symbol = symbol
-        self.base_url = "https://api.bitget.com"
-        self.state_manager = StateManager()
+    """
+    Futures (USDT perpetual) 注文を送信するラッパー。
+    - paper=True のときは実注文を送らずログのみ（state updateは呼び出し元で行う）
+    - symbol は "BTC" 等のシンボル（内部で ccxt 用に 'BTC/USDT:USDT' に変換）
+    """
 
-        # Telegram設定
-        self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        self.tg_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
-    def _sign(self, method, path, body=""):
-        timestamp = str(int(time.time() * 1000))
-        prehash = timestamp + method + path + body
-        sign = hmac.new(
-            self.api_secret.encode("utf-8"),
-            prehash.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-        return timestamp, sign
-
-    def _headers(self, method, path, body=""):
-        timestamp, sign = self._sign(method, path, body)
-        return {
-            "ACCESS-KEY": self.api_key,
-            "ACCESS-SIGN": sign,
-            "ACCESS-TIMESTAMP": timestamp,
-            "ACCESS-PASSPHRASE": self.passphrase,
-            "Content-Type": "application/json"
-        }
-
-    def open_position(self, side, size, entry_price, tp, sl):
-        try:
-            url = f"{self.base_url}/api/mix/v1/order/placeOrder"
-            body = {
-                "symbol": self.symbol,
-                "marginCoin": "USDT",
-                "size": str(size),
-                "side": "open_long" if side == "long" else "open_short",
-                "orderType": "market",
-                "timeInForceValue": "normal",
-                "reduceOnly": False
-            }
-            res = requests.post(url, headers=self._headers("POST", "/api/mix/v1/order/placeOrder", ""), json=body)
-            res_json = res.json()
-
-            if res.status_code == 200 and res_json.get("msg") == "success":
-                logging.info(f"新規建玉成功 {side} {size} {self.symbol}")
-                self.state_manager.add_position(self.symbol, side, entry_price, size, tp, sl)
-                self._notify_telegram(f"✅ 新規建玉: {self.symbol} {side}\n数量: {size}\n価格: {entry_price}\nTP: {tp}, SL: {sl}")
-            else:
-                logging.error(f"建玉失敗 {res_json}")
-        except Exception as e:
-            logging.error(f"open_position エラー: {e}")
-
-    def close_position(self, position, exit_price, reason="manual"):
-        try:
-            url = f"{self.base_url}/api/mix/v1/order/placeOrder"
-            body = {
-                "symbol": position["symbol"],
-                "marginCoin": "USDT",
-                "size": str(position["size"]),
-                "side": "close_long" if position["side"] == "long" else "close_short",
-                "orderType": "market",
-                "timeInForceValue": "normal",
-                "reduceOnly": True
-            }
-            res = requests.post(url, headers=self._headers("POST", "/api/mix/v1/order/placeOrder", ""), json=body)
-            res_json = res.json()
-
-            if res.status_code == 200 and res_json.get("msg") == "success":
-                logging.info(f"ポジション決済成功 {position['side']} {position['symbol']} @ {exit_price}")
-                self.state_manager.close_position(position["symbol"], exit_price, reason)
-                pnl = (exit_price - position["entry_price"]) * position["size"] if position["side"] == "long" else (position["entry_price"] - exit_price) * position["size"]
-                self._notify_telegram(
-                    f"💰 決済完了: {position['symbol']} {position['side']}\n"
-                    f"数量: {position['size']}\nExit価格: {exit_price}\n"
-                    f"理由: {reason.upper()}\n損益: {pnl:.2f} USDT"
-                )
-            else:
-                logging.error(f"決済失敗 {res_json}")
-        except Exception as e:
-            logging.error(f"close_position エラー: {e}")
-
-    def _notify_telegram(self, message: str):
-        if not self.tg_token or not self.tg_chat_id:
+    def __init__(self, api_key: Optional[str], api_secret: Optional[str], api_passphrase: Optional[str] = None,
+                 exchange_id: str = "bitget", paper: bool = True):
+        self.paper = paper
+        self.exchange = None
+        if self.paper:
+            logger.info("TradingExecutor initialized in PAPER_TRADING mode.")
             return
+
+        if not all([api_key, api_secret]):
+            logger.error("API keys not provided — falling back to paper trading mode.")
+            self.paper = True
+            return
+
         try:
-            url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
-            payload = {"chat_id": self.tg_chat_id, "text": message}
-            requests.post(url, json=payload, timeout=10)
+            exc_cls = getattr(ccxt, exchange_id)
+            cfg = {
+                "apiKey": api_key,
+                "secret": api_secret
+            }
+            # bitget uses passphrase for some markets; include if provided
+            if api_passphrase:
+                cfg["password"] = api_passphrase
+            self.exchange = exc_cls(cfg)
+            # ensure futures/perpetual mode
+            try:
+                self.exchange.options['defaultType'] = 'swap'
+            except Exception:
+                pass
+            self.exchange.load_markets()
+            logger.info("TradingExecutor connected to exchange %s", exchange_id)
         except Exception as e:
-            logging.error(f"Telegram通知失敗: {e}")
+            logger.exception("Failed to init exchange client: %s. Switching to paper mode.", e)
+            self.exchange = None
+            self.paper = True
+
+    def _to_ccxt_symbol(self, symbol: str) -> str:
+        # CCXT bitget perpetual format often is "BTC/USDT:USDT"
+        base = symbol.upper()
+        return f"{base}/USDT:USDT"
+
+    def open_futures_position(self, symbol: str, side: str, amount: float) -> Dict[str, Any]:
+        """
+        Open market futures position.
+        side: 'long' or 'short'
+        amount: asset units (contract quantity). NOTE: depending on exchange, amount meaning vary - test carefully.
+        Returns order dict (or simulated result).
+        """
+        logger.info("open_futures_position %s %s amount=%s (paper=%s)", symbol, side, amount, self.paper)
+        if self.paper or not self.exchange:
+            # simulate order result
+            return {"status": "simulated", "symbol": symbol, "side": side, "amount": amount, "price": None}
+        try:
+            ccxt_symbol = self._to_ccxt_symbol(symbol)
+            if side.lower() == "long":
+                order = self.exchange.create_order(ccxt_symbol, 'market', 'buy', amount, None, {"reduceOnly": False})
+            else:
+                order = self.exchange.create_order(ccxt_symbol, 'market', 'sell', amount, None, {"reduceOnly": False})
+            logger.info("Order placed: %s", order)
+            return order
+        except Exception as e:
+            logger.exception("open order failed: %s", e)
+            return {"error": str(e)}
+
+    def close_futures_position(self, symbol: str, side: str, amount: float) -> Dict[str, Any]:
+        """
+        Close (partial or full) position by placing opposite market order with reduceOnly flag.
+        side: current side ('long' or 'short') -> we send opposite order
+        amount: quantity to close
+        """
+        logger.info("close_futures_position %s side=%s amount=%s (paper=%s)", symbol, side, amount, self.paper)
+        if amount <= 0:
+            return {"status": "nothing"}
+        if self.paper or not self.exchange:
+            return {"status": "simulated", "symbol": symbol, "side": side, "amount": amount}
+        try:
+            ccxt_symbol = self._to_ccxt_symbol(symbol)
+            # place opposite side order with reduceOnly True
+            if side.lower() == "long":
+                # closing long = sell
+                order = self.exchange.create_order(ccxt_symbol, 'market', 'sell', amount, None, {"reduceOnly": True})
+            else:
+                # closing short = buy
+                order = self.exchange.create_order(ccxt_symbol, 'market', 'buy', amount, None, {"reduceOnly": True})
+            logger.info("Close order placed: %s", order)
+            return order
+        except Exception as e:
+            logger.exception("close order failed: %s", e)
+            return {"error": str(e)}
