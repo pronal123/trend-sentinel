@@ -1,184 +1,133 @@
+# state_manager.py
+import time
+import logging
 import json
 import os
-import threading
-from datetime import datetime
-from typing import Any, Dict, List
+from datetime import datetime, timezone, timedelta
 
+JST = timezone(timedelta(hours=9))
 
 class StateManager:
-    """
-    Handles persistent state of the bot:
-      - Last snapshot (market info per cycle)
-      - Active positions with TP/SL, partial TP, trailing
-      - Account balance (simulation mode)
-    """
+    def __init__(self, filename="state.json", notification_interval=21600): # 6h
+        self.filename = filename
+        self.notification_interval = notification_interval
 
-    def __init__(self, filepath: str = "state.json", initial_balance: float = 10000.0):
-        self.filepath = filepath
-        self.lock = threading.Lock()
-        self.state: Dict[str, Any] = {
-            "last_snapshot": None,
-            "positions": {},   # {symbol: {...}}
-            "balance": initial_balance,
-            "last_update": None,
+        # 状態保持
+        self.state = {
+            "balance": 0.0,
+            "positions": {},      # {'token_id': {'in_position': True, 'details': {...}}}
+            "trade_history": [],  # [{'token_id': str, 'result': 'win'/'loss'}]
+            "pending_signals": {},# {'token_id': {...}}
+            "events": [],         # 通知用イベントログ
+            "last_id": 0,         # イベントID
+            "daily_pnl": {},      # {日付: 損益合計}
+            "trade_counts": {},   # {日付: {"entry": n, "close": m}}
+            "notified_tokens": {} # 通知済み管理
         }
-        self._load_state()
+        self.load()
 
-    # ---------------- Internal persistence ----------------
-    def _load_state(self):
-        if os.path.exists(self.filepath):
+    # --- 永続化 ---
+    def load(self):
+        if os.path.exists(self.filename):
             try:
-                with open(self.filepath, "r") as f:
+                with open(self.filename, "r") as f:
                     self.state = json.load(f)
             except Exception as e:
-                print(f"⚠️ Failed to load state file: {e}")
-        else:
-            self._save_state()
+                logging.error(f"State load error: {e}")
 
-    def _save_state(self):
+    def save(self):
         try:
-            with self.lock:
-                with open(self.filepath, "w") as f:
-                    json.dump(self.state, f, indent=2, default=str)
+            with open(self.filename, "w") as f:
+                json.dump(self.state, f, indent=2)
         except Exception as e:
-            print(f"⚠️ Failed to save state file: {e}")
+            logging.error(f"State save error: {e}")
 
-    # ---------------- Snapshot management ----------------
-    def get_last_snapshot(self) -> Any:
-        return self.state.get("last_snapshot")
+    # --- 残高 ---
+    def update_balance(self, balance):
+        self.state["balance"] = balance
+        self.save()
 
-    def update_last_snapshot(self, snapshot: Any):
-        with self.lock:
-            self.state["last_snapshot"] = snapshot
-            self.state["last_update"] = datetime.utcnow().isoformat()
-            self._save_state()
+    def get_balance(self):
+        return self.state.get("balance", 0.0)
 
-    # ---------------- Position management ----------------
-    def get_positions(self) -> Dict[str, Any]:
-        return self.state.get("positions", {})
+    # --- ポジション ---
+    def set_position(self, token_id, status, details=None):
+        self.state["positions"][token_id] = {"in_position": status, "details": details}
+        logging.info(f"Position for {token_id} set to {status}.")
+        self.save()
 
-    def has_position(self, symbol: str) -> bool:
-        return symbol in self.state.get("positions", {})
+    def has_position(self, token_id):
+        return self.state["positions"].get(token_id, {}).get("in_position", False)
 
-    def add_position(self, symbol: str, position: Dict[str, Any]):
-        """Add or update a position with full structure."""
-        default_position = {
-            "symbol": symbol,
-            "side": position.get("side", "long"),
-            "entry": position.get("entry"),
-            "size": position.get("size", 0.0),
-            "tp": position.get("tp"),
-            "sl": position.get("sl"),
-            "trail_active": position.get("trail_active", False),
-            "trail_offset": position.get("trail_offset", None),
-            "partial_targets": position.get("partial_targets", []),  # list of dicts
-            "status": "open",
-            "opened_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
+    def get_position_details(self, token_id):
+        return self.state["positions"].get(token_id, {}).get("details")
+
+    def get_all_positions(self):
+        return {
+            token_id: pos["details"]
+            for token_id, pos in self.state["positions"].items()
+            if pos.get("in_position", False)
         }
-        with self.lock:
-            self.state["positions"][symbol] = default_position
-            self.state["last_update"] = datetime.utcnow().isoformat()
-            self._save_state()
 
-    def update_position(self, symbol: str, updates: Dict[str, Any]):
-        with self.lock:
-            if symbol in self.state["positions"]:
-                self.state["positions"][symbol].update(updates)
-                self.state["positions"][symbol]["updated_at"] = datetime.utcnow().isoformat()
-                self.state["last_update"] = datetime.utcnow().isoformat()
-                self._save_state()
+    def close_position(self, token_id):
+        if token_id in self.state["positions"]:
+            del self.state["positions"][token_id]
+            self.save()
 
-    def remove_position(self, symbol: str):
-        with self.lock:
-            if symbol in self.state["positions"]:
-                del self.state["positions"][symbol]
-                self.state["last_update"] = datetime.utcnow().isoformat()
-                self._save_state()
+    # --- シグナル ---
+    def add_pending_signal(self, token_id, details):
+        self.state["pending_signals"][token_id] = details
+        logging.info(f"Signal for {token_id} is now PENDING CONFIRMATION.")
+        self.save()
 
-    # ---------------- Balance management ----------------
-    def get_balance(self) -> float:
-        return float(self.state.get("balance", 0.0))
+    def get_and_clear_pending_signals(self):
+        pending = self.state["pending_signals"]
+        self.state["pending_signals"] = {}
+        self.save()
+        return pending
 
-    def adjust_balance(self, delta: float):
-        with self.lock:
-            self.state["balance"] = float(self.state.get("balance", 0.0)) + delta
-            self.state["last_update"] = datetime.utcnow().isoformat()
-            self._save_state()
+    # --- 勝率 ---
+    def record_trade_result(self, token_id, result):
+        if result in ["win", "loss"]:
+            self.state["trade_history"].append({"token_id": token_id, "result": result})
+            logging.info(f"Trade result recorded for {token_id}: {result}")
+            self.save()
 
-    # ---------------- Advanced Position Logic ----------------
-    def check_partial_take_profits(self, symbol: str, price: float):
-        """Check if partial TP triggers at current price."""
-        if symbol not in self.state["positions"]:
-            return []
-
-        pos = self.state["positions"][symbol]
-        executed_targets = []
-        side = pos["side"]
-
-        for target in pos.get("partial_targets", []):
-            if target["executed"]:
-                continue
-
-            trigger = (
-                price >= target["price"] if side == "long" else price <= target["price"]
-            )
-            if trigger:
-                portion = pos["size"] * target["size_pct"]
-                pnl = (price - pos["entry"]) * portion if side == "long" else (pos["entry"] - price) * portion
-                self.adjust_balance(pnl)
-                target["executed"] = True
-                executed_targets.append(target)
-                print(f"✅ Partial TP executed: {symbol} @ {price}, PnL={pnl:.2f}")
-
-        self.update_position(symbol, {"partial_targets": pos["partial_targets"]})
-        return executed_targets
-
-    def update_trailing_stop(self, symbol: str, price: float):
-        """Update SL if trailing is active and price moves in favor."""
-        if symbol not in self.state["positions"]:
-            return None
-
-        pos = self.state["positions"][symbol]
-        if not pos.get("trail_active") or not pos.get("trail_offset"):
-            return None
-
-        side = pos["side"]
-        trail_offset = pos["trail_offset"]
-        new_sl = None
-
-        if side == "long":
-            candidate_sl = price - trail_offset
-            if pos["sl"] is None or candidate_sl > pos["sl"]:
-                new_sl = candidate_sl
-        else:  # short
-            candidate_sl = price + trail_offset
-            if pos["sl"] is None or candidate_sl < pos["sl"]:
-                new_sl = candidate_sl
-
-        if new_sl:
-            self.update_position(symbol, {"sl": new_sl})
-            print(f"🔄 Trailing SL updated: {symbol} → {new_sl}")
-            return new_sl
-        return None
-
-    def realize_pnl(self, symbol: str, close_price: float):
-        """Close position fully and realize PnL."""
-        if symbol not in self.state["positions"]:
+    def get_win_rate(self):
+        if not self.state["trade_history"]:
             return 0.0
+        wins = sum(1 for t in self.state["trade_history"] if t["result"] == "win")
+        total = len(self.state["trade_history"])
+        return (wins / total) * 100
 
-        pos = self.state["positions"][symbol]
-        side = pos["side"]
-        size = pos["size"]
-        entry = pos["entry"]
+    # --- イベントログ ---
+    def log_event(self, event: dict):
+        self.state["last_id"] += 1
+        event["id"] = self.state["last_id"]
+        event["timestamp"] = time.time()
+        self.state["events"].append(event)
 
-        pnl = (close_price - entry) * size if side == "long" else (entry - close_price) * size
-        self.adjust_balance(pnl)
+        date_str = datetime.now(JST).strftime("%Y-%m-%d")
 
-        self.remove_position(symbol)
-        print(f"💰 Position closed: {symbol}, PnL={pnl:.2f}")
-        return pnl
+        if event["type"] == "entry":
+            self.state["trade_counts"].setdefault(date_str, {"entry": 0, "close": 0})
+            self.state["trade_counts"][date_str]["entry"] += 1
 
-    # ---------------- Utility ----------------
-    def get_state_snapshot(self) -> Dict[str, Any]:
-        return self.state
+        elif event["type"] == "close":
+            self.state["trade_counts"].setdefault(date_str, {"entry": 0, "close": 0})
+            self.state["trade_counts"][date_str]["close"] += 1
+            pnl = event.get("pnl", 0.0)
+            self.state["daily_pnl"][date_str] = self.state["daily_pnl"].get(date_str, 0.0) + pnl
+
+        self.save()
+
+    def get_trade_events(self):
+        return self.state.get("events", [])
+
+    def get_today_pnl(self):
+        date_str = datetime.now(JST).strftime("%Y-%m-%d")
+        return self.state["daily_pnl"].get(date_str, 0.0)
+
+    def get_today_trade_counts(self):
+        date_str = datetime.now(JST).strftime("%Y-%m-%d")
+        return self.state["trade_counts"].get(date_str, {"entry": 0, "close": 0})
