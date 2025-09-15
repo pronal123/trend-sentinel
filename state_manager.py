@@ -1,157 +1,125 @@
 import logging
-import statistics
 from datetime import datetime
-from typing import List, Dict, Any
-
-logger = logging.getLogger(__name__)
+from typing import Dict, Any, Optional
 
 
 class StateManager:
-    def __init__(self, initial_balance: float = 10000.0):
-        self.balance = initial_balance
-        self.initial_balance = initial_balance
-        self.positions: Dict[str, Dict[str, Any]] = {}
-        self.trade_history: List[Dict[str, Any]] = []
+    """
+    システム全体の状態を管理するクラス
+    - 残高
+    - 建玉
+    - トレード履歴
+    - サイクルごとのスナップショット
+    - 勝率や統計情報
+    """
 
-    # =========================================================
-    # 残高・ポジション管理
-    # =========================================================
-    def update_balance(self, amount: float):
-        self.balance += amount
-        logger.info(f"[Balance Updated] New balance={self.balance:.2f}")
+    def __init__(self):
+        self.balance: float = 0.0
+        self.positions: Dict[str, Dict[str, Any]] = {}
+        self.last_snapshot: Optional[Dict[str, Any]] = None
+        self.trade_history: list[Dict[str, Any]] = []
+        self.stats: Dict[str, Any] = {
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "profit_loss": 0.0,
+        }
+
+    # ==============================
+    # Balance 管理
+    # ==============================
+    def update_balance(self, new_balance: float):
+        self.balance = new_balance
+        logging.info(f"[STATE] Balance updated: {new_balance}")
 
     def get_balance(self) -> float:
         return self.balance
 
-    def add_position(self, symbol: str, side: str, size: float, entry: float,
-                     tp: float = None, sl: float = None):
-        self.positions[symbol] = {
-            "symbol": symbol,
-            "side": side,
-            "size": size,
-            "entry": entry,
-            "tp": tp,
-            "sl": sl,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        logger.info(f"[Position Opened] {symbol} {side} {size}@{entry}, TP={tp}, SL={sl}")
+    # ==============================
+    # Positions 管理
+    # ==============================
+    def update_position(self, symbol: str, position: Dict[str, Any]):
+        """建玉を更新"""
+        self.positions[symbol] = position
+        logging.info(f"[STATE] Position updated for {symbol}: {position}")
 
-    def close_position(self, symbol: str, exit_price: float):
-        if symbol not in self.positions:
-            return None
-
-        pos = self.positions.pop(symbol)
-        pnl = (exit_price - pos["entry"]) * pos["size"]
-        if pos["side"].lower() == "short":
-            pnl *= -1
-
-        self.update_balance(pnl)
-
-        trade = {
-            "symbol": symbol,
-            "side": pos["side"],
-            "size": pos["size"],
-            "entry": pos["entry"],
-            "exit": exit_price,
-            "pnl": pnl,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        self.trade_history.append(trade)
-        logger.info(f"[Position Closed] {symbol} exit={exit_price}, PnL={pnl:.2f}")
-        return trade
+    def remove_position(self, symbol: str):
+        """建玉を削除"""
+        if symbol in self.positions:
+            del self.positions[symbol]
+            logging.info(f"[STATE] Position removed for {symbol}")
 
     def get_positions(self) -> Dict[str, Dict[str, Any]]:
         return self.positions
 
-    def get_trade_history(self) -> List[Dict[str, Any]]:
+    # ==============================
+    # Trade History 管理
+    # ==============================
+    def record_trade(self, trade: Dict[str, Any]):
+        """
+        トレード履歴を記録
+        trade = {
+            "symbol": str,
+            "side": "long" | "short",
+            "entry_price": float,
+            "exit_price": float,
+            "pnl": float
+        }
+        """
+        trade["timestamp"] = datetime.utcnow().isoformat()
+        self.trade_history.append(trade)
+
+        # Stats 更新
+        self.stats["total_trades"] += 1
+        self.stats["profit_loss"] += trade.get("pnl", 0.0)
+        if trade.get("pnl", 0.0) > 0:
+            self.stats["wins"] += 1
+        else:
+            self.stats["losses"] += 1
+
+        if self.stats["total_trades"] > 0:
+            self.stats["win_rate"] = (
+                self.stats["wins"] / self.stats["total_trades"]
+            )
+
+        logging.info(f"[STATE] Trade recorded: {trade}")
+
+    def get_trade_history(self) -> list[Dict[str, Any]]:
         return self.trade_history
 
-    # =========================================================
-    # 統計系メトリクス
-    # =========================================================
-    def get_win_rate(self, lookback: int = 1000) -> float:
-        trades = self.trade_history[-lookback:]
-        if not trades:
-            return 0.0
-        wins = sum(1 for t in trades if t["pnl"] > 0)
-        return wins / len(trades)
+    # ==============================
+    # Snapshot 管理
+    # ==============================
+    def update_last_snapshot(self, snapshot: Dict[str, Any]):
+        """
+        各サイクルのスナップショットを保存
+        snapshot = {
+            "timestamp": str,
+            "symbols": list[str],
+            "analysis": dict,
+            "positions": dict
+        }
+        """
+        self.last_snapshot = snapshot
+        logging.debug("[STATE] Last snapshot updated")
 
-    def get_profit_factor(self, lookback: int = 1000) -> float:
-        trades = self.trade_history[-lookback:]
-        gains = sum(t["pnl"] for t in trades if t["pnl"] > 0)
-        losses = -sum(t["pnl"] for t in trades if t["pnl"] < 0)
-        return gains / losses if losses > 0 else float("inf")
+    def get_last_snapshot(self) -> Optional[Dict[str, Any]]:
+        return self.last_snapshot
 
-    def get_sharpe_ratio(self, lookback: int = 1000) -> float:
-        trades = self.trade_history[-lookback:]
-        returns = [t["pnl"] / self.initial_balance for t in trades]
-        if len(returns) < 2:
-            return 0.0
-        mean_r = statistics.mean(returns)
-        std_r = statistics.stdev(returns)
-        return mean_r / std_r if std_r > 0 else 0.0
+    # ==============================
+    # Stats 管理
+    # ==============================
+    def get_win_rate(self) -> float:
+        return self.stats.get("win_rate", 0.0)
 
-    def get_max_drawdown(self, lookback: int = 1000) -> float:
-        trades = self.trade_history[-lookback:]
-        equity_curve = []
-        equity = 0
-        max_equity = 0
-        max_dd = 0
-        for t in trades:
-            equity += t["pnl"]
-            max_equity = max(max_equity, equity)
-            dd = (equity - max_equity)
-            max_dd = min(max_dd, dd)
-        return max_dd
-
-    # =========================================================
-    # AI風コメント生成
-    # =========================================================
-    def generate_ai_comment(self, symbol: str, orderbook: Dict[str, Any],
-                            ticker: Dict[str, Any], atr: float,
-                            fear_greed: str = "Unknown") -> str:
-        bid_depth = sum([b[1] for b in orderbook.get("bids", [])[:5]]) if orderbook else 0
-        ask_depth = sum([a[1] for a in orderbook.get("asks", [])[:5]]) if orderbook else 0
-        imbalance = "Buyers strong" if bid_depth > ask_depth else "Sellers strong"
-
-        comment = (
-            f"[AI Market View] {symbol}\n"
-            f"・市場心理(Fear&Greed): {fear_greed}\n"
-            f"・板厚分析: Bid={bid_depth:.2f}, Ask={ask_depth:.2f}, ({imbalance})\n"
-            f"・ATR(Volatility): {atr:.2f}\n"
-            f"・最新価格: {ticker.get('last', 'N/A')}\n"
-            f"・チャート傾向: {'上昇' if ticker.get('change', 0) > 0 else '下落'}\n"
-        )
-        return comment
-
-    # =========================================================
-    # 総合スコアリング
-    # =========================================================
-    def get_composite_score(self, lookback: int = 1000) -> float:
-        wr = self.get_win_rate(lookback)
-        pf = self.get_profit_factor(lookback)
-        sharpe = self.get_sharpe_ratio(lookback)
-
-        score = 0
-        if wr > 0.5:
-            score += 1
-        if pf > 1.0:
-            score += 1
-        if sharpe > 1.0:
-            score += 1
-        return score
-
-    # =========================================================
-    # まとめて統計返却
-    # =========================================================
-    def get_stats(self, lookback: int = 1000) -> Dict[str, Any]:
+    def get_stats(self) -> Dict[str, Any]:
         return {
-            "balance": self.get_balance(),
-            "positions": self.get_positions(),
-            "trade_count": len(self.trade_history),
-            "win_rate": self.get_win_rate(lookback),
-            "profit_factor": self.get_profit_factor(lookback),
-            "sharpe": self.get_sharpe_ratio(lookback),
-            "max_drawdown": self.get_max_drawdown(lookback),
-            "composite_score": self.get_composite_score(lookback),
+            "balance": self.balance,
+            "open_positions": len(self.positions),
+            "trade_count": self.stats["total_trades"],
+            "wins": self.stats["wins"],
+            "losses": self.stats["losses"],
+            "win_rate": self.stats["win_rate"],
+            "profit_loss": self.stats["profit_loss"],
         }
