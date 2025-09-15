@@ -1,115 +1,184 @@
-import logging
-import statistics
-from typing import Dict, Any, List
+import json
+import os
+import threading
 from datetime import datetime
+from typing import Any, Dict, List
 
 
 class StateManager:
     """
-    トレード状態・ポジション・残高を管理
-    部分利確・トレーリング・勝率統計をサポート
+    Handles persistent state of the bot:
+      - Last snapshot (market info per cycle)
+      - Active positions with TP/SL, partial TP, trailing
+      - Account balance (simulation mode)
     """
 
-    def __init__(self, starting_balance: float = 1000.0):
-        self.balance = starting_balance
-        self.positions: Dict[str, Dict[str, Any]] = {}
-        self.trade_history: List[Dict[str, Any]] = []
-        self.realized_pnl = 0.0
-
-    # ===== Balance =====
-    def get_balance(self) -> float:
-        return self.balance
-
-    def update_balance(self, delta: float):
-        self.balance += delta
-        logging.info(f"Balance updated: {self.balance:.2f} USDT")
-
-    # ===== Position =====
-    def has_position(self, symbol: str) -> bool:
-        return symbol in self.positions
-
-    def open_position(self, symbol: str, side: str, entry_price: float,
-                      amount: float, tp: float, sl: float, leverage: float):
-        self.positions[symbol] = {
-            "symbol": symbol,
-            "side": side,
-            "entry_price": entry_price,
-            "amount": amount,
-            "take_profit": tp,
-            "stop_loss": sl,
-            "leverage": leverage,
-            "opened_at": datetime.utcnow().isoformat(),
+    def __init__(self, filepath: str = "state.json", initial_balance: float = 10000.0):
+        self.filepath = filepath
+        self.lock = threading.Lock()
+        self.state: Dict[str, Any] = {
+            "last_snapshot": None,
+            "positions": {},   # {symbol: {...}}
+            "balance": initial_balance,
+            "last_update": None,
         }
-        logging.info(f"OPEN {side.upper()} {symbol} entry={entry_price:.4f} tp={tp:.4f} sl={sl:.4f}")
+        self._load_state()
 
-    def close_position(self, symbol: str, exit_price: float,
-                       reason: str = "", portion: float = 1.0) -> Dict[str, Any]:
-        if symbol not in self.positions:
-            raise KeyError(f"No open position for {symbol}")
-        pos = self.positions[symbol]
+    # ---------------- Internal persistence ----------------
+    def _load_state(self):
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r") as f:
+                    self.state = json.load(f)
+            except Exception as e:
+                print(f"⚠️ Failed to load state file: {e}")
+        else:
+            self._save_state()
+
+    def _save_state(self):
+        try:
+            with self.lock:
+                with open(self.filepath, "w") as f:
+                    json.dump(self.state, f, indent=2, default=str)
+        except Exception as e:
+            print(f"⚠️ Failed to save state file: {e}")
+
+    # ---------------- Snapshot management ----------------
+    def get_last_snapshot(self) -> Any:
+        return self.state.get("last_snapshot")
+
+    def update_last_snapshot(self, snapshot: Any):
+        with self.lock:
+            self.state["last_snapshot"] = snapshot
+            self.state["last_update"] = datetime.utcnow().isoformat()
+            self._save_state()
+
+    # ---------------- Position management ----------------
+    def get_positions(self) -> Dict[str, Any]:
+        return self.state.get("positions", {})
+
+    def has_position(self, symbol: str) -> bool:
+        return symbol in self.state.get("positions", {})
+
+    def add_position(self, symbol: str, position: Dict[str, Any]):
+        """Add or update a position with full structure."""
+        default_position = {
+            "symbol": symbol,
+            "side": position.get("side", "long"),
+            "entry": position.get("entry"),
+            "size": position.get("size", 0.0),
+            "tp": position.get("tp"),
+            "sl": position.get("sl"),
+            "trail_active": position.get("trail_active", False),
+            "trail_offset": position.get("trail_offset", None),
+            "partial_targets": position.get("partial_targets", []),  # list of dicts
+            "status": "open",
+            "opened_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        with self.lock:
+            self.state["positions"][symbol] = default_position
+            self.state["last_update"] = datetime.utcnow().isoformat()
+            self._save_state()
+
+    def update_position(self, symbol: str, updates: Dict[str, Any]):
+        with self.lock:
+            if symbol in self.state["positions"]:
+                self.state["positions"][symbol].update(updates)
+                self.state["positions"][symbol]["updated_at"] = datetime.utcnow().isoformat()
+                self.state["last_update"] = datetime.utcnow().isoformat()
+                self._save_state()
+
+    def remove_position(self, symbol: str):
+        with self.lock:
+            if symbol in self.state["positions"]:
+                del self.state["positions"][symbol]
+                self.state["last_update"] = datetime.utcnow().isoformat()
+                self._save_state()
+
+    # ---------------- Balance management ----------------
+    def get_balance(self) -> float:
+        return float(self.state.get("balance", 0.0))
+
+    def adjust_balance(self, delta: float):
+        with self.lock:
+            self.state["balance"] = float(self.state.get("balance", 0.0)) + delta
+            self.state["last_update"] = datetime.utcnow().isoformat()
+            self._save_state()
+
+    # ---------------- Advanced Position Logic ----------------
+    def check_partial_take_profits(self, symbol: str, price: float):
+        """Check if partial TP triggers at current price."""
+        if symbol not in self.state["positions"]:
+            return []
+
+        pos = self.state["positions"][symbol]
+        executed_targets = []
+        side = pos["side"]
+
+        for target in pos.get("partial_targets", []):
+            if target["executed"]:
+                continue
+
+            trigger = (
+                price >= target["price"] if side == "long" else price <= target["price"]
+            )
+            if trigger:
+                portion = pos["size"] * target["size_pct"]
+                pnl = (price - pos["entry"]) * portion if side == "long" else (pos["entry"] - price) * portion
+                self.adjust_balance(pnl)
+                target["executed"] = True
+                executed_targets.append(target)
+                print(f"✅ Partial TP executed: {symbol} @ {price}, PnL={pnl:.2f}")
+
+        self.update_position(symbol, {"partial_targets": pos["partial_targets"]})
+        return executed_targets
+
+    def update_trailing_stop(self, symbol: str, price: float):
+        """Update SL if trailing is active and price moves in favor."""
+        if symbol not in self.state["positions"]:
+            return None
+
+        pos = self.state["positions"][symbol]
+        if not pos.get("trail_active") or not pos.get("trail_offset"):
+            return None
 
         side = pos["side"]
-        amount = pos["amount"] * portion
-        entry = pos["entry_price"]
+        trail_offset = pos["trail_offset"]
+        new_sl = None
 
-        pnl = (exit_price - entry) * amount if side == "long" else (entry - exit_price) * amount
-        self.realized_pnl += pnl
-        self.update_balance(pnl)
+        if side == "long":
+            candidate_sl = price - trail_offset
+            if pos["sl"] is None or candidate_sl > pos["sl"]:
+                new_sl = candidate_sl
+        else:  # short
+            candidate_sl = price + trail_offset
+            if pos["sl"] is None or candidate_sl < pos["sl"]:
+                new_sl = candidate_sl
 
-        trade_record = {
-            "symbol": symbol,
-            "side": side,
-            "entry_price": entry,
-            "exit_price": exit_price,
-            "amount": amount,
-            "pnl": pnl,
-            "reason": reason,
-            "closed_at": datetime.utcnow().isoformat(),
-        }
-        self.trade_history.append(trade_record)
+        if new_sl:
+            self.update_position(symbol, {"sl": new_sl})
+            print(f"🔄 Trailing SL updated: {symbol} → {new_sl}")
+            return new_sl
+        return None
 
-        if portion >= 1.0:
-            del self.positions[symbol]
-        else:
-            self.positions[symbol]["amount"] -= amount
-
-        logging.info(f"CLOSE {portion*100:.0f}% {symbol} at {exit_price:.4f}, pnl={pnl:.2f}")
-        return trade_record
-
-    def trail_stop(self, symbol: str, current_price: float, trail_pct: float = 0.01):
-        """価格が有利方向に進んだ場合、SLを更新"""
-        if symbol not in self.positions:
-            return
-        pos = self.positions[symbol]
-        if pos["side"] == "long":
-            new_sl = max(pos["stop_loss"], current_price * (1 - trail_pct))
-            if new_sl > pos["stop_loss"]:
-                pos["stop_loss"] = new_sl
-        else:
-            new_sl = min(pos["stop_loss"], current_price * (1 + trail_pct))
-            if new_sl < pos["stop_loss"]:
-                pos["stop_loss"] = new_sl
-
-    # ===== Stats =====
-    def get_win_rate(self) -> float:
-        if not self.trade_history:
+    def realize_pnl(self, symbol: str, close_price: float):
+        """Close position fully and realize PnL."""
+        if symbol not in self.state["positions"]:
             return 0.0
-        wins = sum(1 for t in self.trade_history if t["pnl"] > 0)
-        return wins / len(self.trade_history)
 
-    def get_risk_reward(self) -> float:
-        losses = [t["pnl"] for t in self.trade_history if t["pnl"] < 0]
-        wins = [t["pnl"] for t in self.trade_history if t["pnl"] > 0]
-        if not wins or not losses:
-            return 0.0
-        return abs(statistics.mean(wins) / statistics.mean(losses))
+        pos = self.state["positions"][symbol]
+        side = pos["side"]
+        size = pos["size"]
+        entry = pos["entry"]
 
-    def get_stats(self) -> Dict[str, Any]:
-        return {
-            "balance": self.balance,
-            "realized_pnl": self.realized_pnl,
-            "open_positions": list(self.positions.keys()),
-            "win_rate": self.get_win_rate(),
-            "rr_ratio": self.get_risk_reward(),
-            "trades": len(self.trade_history),
-        }
+        pnl = (close_price - entry) * size if side == "long" else (entry - close_price) * size
+        self.adjust_balance(pnl)
+
+        self.remove_position(symbol)
+        print(f"💰 Position closed: {symbol}, PnL={pnl:.2f}")
+        return pnl
+
+    # ---------------- Utility ----------------
+    def get_state_snapshot(self) -> Dict[str, Any]:
+        return self.state
