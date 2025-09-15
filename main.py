@@ -456,6 +456,10 @@ def check_positions_and_manage():
             logging.exception("check pos failed %s: %s", sym, e)
 
 # ---------------- Scheduler & Flask status ----------------
+@app.route("/health")
+def health():
+    return "ok", 200
+
 @app.route("/status")
 def status():
     key = request.args.get("key", "")
@@ -485,3 +489,4 @@ if __name__ == "__main__":
     t.start()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
