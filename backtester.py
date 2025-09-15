@@ -1,125 +1,117 @@
 # backtester.py
-import numpy as np
-from typing import List, Tuple
 import math
-
+import statistics
+from typing import List, Dict, Any, Tuple
 
 class Backtester:
-    """
-    シンプルなルールを過去OHLCVに適用してトレード1000回相当のパフォーマンスを算出するモジュール。
-    - 入退出ルールは main.py のルールに合わせる（ここは簡易実装）
-    """
+    def __init__(self, fee_pct: float = 0.0006, slippage_pct: float = 0.005):
+        self.fee_pct = fee_pct
+        self.slippage_pct = slippage_pct
 
-    def __init__(self, ohlcv: List[List[float]]):
+    def run_rule_backtest(self, ohlcv: List[Dict[str, Any]], rule_params: Dict[str, Any], max_trades: int = 1000) -> Dict[str, Any]:
         """
-        ohlcv: list of [ts, open, high, low, close, volume]
+        ohlcv: list of candles dict with 'time','open','high','low','close','volume' (chronological old->new)
+        Very simple rule: when 1-day change > threshold -> enter long at next open; when < -threshold -> enter short.
+        TP/SL from ATR multiplier based on past ATR calculation.
         """
-        self.ohlcv = ohlcv
-
-    def run_rule_sim(self, atr_period=14, tp_mult=2.0, sl_mult=1.0, position_usd=100.0, initial_balance=10000.0) -> dict:
-        """
-        単純バックテスト：
-         - シンプル指標：1日（あるいは与えられたtf）で前日比が閾値を満たせばエントリー（ここは main と呼応）
-         - TP/SL は ATR に基づく固定倍率
-        """
-        n = len(self.ohlcv)
-        if n < atr_period + 2:
-            return {}
-
-        # convert closes
-        closes = [row[4] for row in self.ohlcv]
-        highs = [row[2] for row in self.ohlcv]
-        lows = [row[3] for row in self.ohlcv]
-
-        # calc ATR rolling
-        trs = []
-        for i in range(1, n):
-            tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-            trs.append(tr)
-        atrs = []
-        for i in range(atr_period, len(trs)):
-            atrs.append(sum(trs[i-atr_period:i]) / atr_period)
-
-        balance = initial_balance
-        eq_curve = []
         trades = []
-
-        # iterate but ensure index alignment
-        for i in range(atr_period + 1, n - 1):
-            price = closes[i]
-            prev = closes[i-1]
-            # simple momentum signal
-            change_pct = (price / prev - 1) * 100.0
-            atr = atrs[i - (atr_period + 1)] if (i - (atr_period + 1)) < len(atrs) and (i - (atr_period + 1)) >= 0 else None
-            if atr is None:
-                continue
-            # entry rules (example): strong 1-step momentum
-            if change_pct > 5.0:
-                # long
-                entry = price
-                tp = entry + tp_mult * atr
-                sl = entry - sl_mult * atr
-                # simulate next bars until hit TP or SL or close at next bar close
-                pnl = 0.0
-                for j in range(i+1, min(n, i+100)):  # look ahead
-                    high = highs[j]; low = lows[j]; close_j = closes[j]
-                    if low <= sl:
-                        pnl = sl - entry
-                        break
-                    if high >= tp:
-                        pnl = tp - entry
-                        break
-                    # last fallback use close
-                    if j == min(n, i+100)-1:
-                        pnl = close_j - entry
-                pnl_usdt = pnl * (position_usd / entry)
-                balance += pnl_usdt
-                trades.append(pnl_usdt)
-                eq_curve.append(balance)
-            elif change_pct < -5.0:
-                # short
-                entry = price
-                tp = entry - tp_mult * atr
-                sl = entry + sl_mult * atr
-                pnl = 0.0
-                for j in range(i+1, min(n, i+100)):
-                    high = highs[j]; low = lows[j]; close_j = closes[j]
-                    if high >= sl:
-                        pnl = entry - sl
-                        break
-                    if low <= tp:
-                        pnl = entry - tp
-                        break
-                    if j == min(n, i+100)-1:
-                        pnl = entry - close_j
-                pnl_usdt = pnl * (position_usd / entry)
-                balance += pnl_usdt
-                trades.append(pnl_usdt)
-                eq_curve.append(balance)
-            # else no trade
-
-        # metrics
-        trades_arr = np.array(trades) if trades else np.array([0.0])
-        wins = trades_arr[trades_arr > 0]
-        losses = trades_arr[trades_arr <= 0]
-        win_rate = 100.0 * (len(wins) / len(trades)) if len(trades) > 0 else 0.0
-        gross_profit = wins.sum() if len(wins) else 0.0
-        gross_loss = abs(losses.sum()) if len(losses) else 0.0
-        pf = (gross_profit / gross_loss) if gross_loss > 0 else None
-        sharpe = (trades_arr.mean() / (trades_arr.std() + 1e-9)) * (252 ** 0.5) if trades_arr.std() > 0 else None
+        balance = 10000.0
+        for i in range(2, len(ohlcv)):
+            if len(trades) >= max_trades:
+                break
+            today = ohlcv[i]
+            prev = ohlcv[i-1]
+            change_pct = (today["close"] / prev["close"] - 1.0) * 100.0
+            threshold = rule_params.get("price_change_threshold_pct", 5.0)
+            if change_pct >= threshold:
+                # Long entry at next open (simulated as today's open)
+                entry = today["open"]
+                atr = self._calc_atr_from_ohlcv(ohlcv[:i+1], period=rule_params.get("atr_period", 14))
+                if atr is None: continue
+                tp = entry + rule_params.get("tp_atr_mult", 2.0) * atr
+                sl = entry - rule_params.get("sl_atr_mult", 1.0) * atr
+                # simulate exit at first candle where high >= tp or low <= sl
+                pnl, exit_price = self._simulate_exit_long(ohlcv[i+1:], entry, tp, sl)
+                pnl = pnl - abs(pnl) * self.fee_pct - abs(entry) * self.slippage_pct  # fees+slippage rough adjust
+                trades.append({"side":"long","entry":entry,"exit":exit_price,"pnl":pnl})
+                balance += pnl
+            elif change_pct <= -threshold:
+                entry = today["open"]
+                atr = self._calc_atr_from_ohlcv(ohlcv[:i+1], period=rule_params.get("atr_period", 14))
+                if atr is None: continue
+                tp = entry - rule_params.get("tp_atr_mult",2.0)*atr
+                sl = entry + rule_params.get("sl_atr_mult",1.0)*atr
+                pnl, exit_price = self._simulate_exit_short(ohlcv[i+1:], entry, tp, sl)
+                pnl = pnl - abs(pnl) * self.fee_pct - abs(entry) * self.slippage_pct
+                trades.append({"side":"short","entry":entry,"exit":exit_price,"pnl":pnl})
+                balance += pnl
+        # compute metrics
+        pnl_series = [t["pnl"] for t in trades]
+        wins = sum(1 for p in pnl_series if p > 0)
+        losses = sum(1 for p in pnl_series if p <= 0)
+        win_rate = (wins / len(pnl_series) * 100.0) if pnl_series else 0.0
+        gross_profit = sum(p for p in pnl_series if p > 0)
+        gross_loss = -sum(p for p in pnl_series if p < 0)
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf") if gross_profit>0 else None
+        mean = statistics.mean(pnl_series) if pnl_series else 0.0
+        std = statistics.pstdev(pnl_series) if len(pnl_series) > 1 else 0.0
+        sharpe = (mean / std) if std > 0 else None
+        # drawdown
+        equity = []
+        b = 10000.0
+        peak = b
         max_dd = 0.0
-        if eq_curve:
-            import numpy as _np
-            ec = _np.array(eq_curve)
-            peak = _np.maximum.accumulate(ec)
-            dd = (ec - peak) / peak
-            max_dd = float(dd.min() * 100)
-
+        for p in pnl_series:
+            b += p
+            equity.append(b)
+            peak = max(peak, b)
+            dd = (b - peak) / peak
+            if dd < max_dd:
+                max_dd = dd
         return {
-            "final_balance": float(balance),
-            "win_rate": float(win_rate),
-            "profit_factor": pf,
+            "n_trades": len(pnl_series),
+            "win_rate": win_rate,
+            "profit_factor": profit_factor,
             "sharpe": sharpe,
-            "max_drawdown_pct": max_dd,
-            "trades": len(trades)
+            "max_drawdown": max_dd * 100.0,
+            "final_balance": b,
+            "trades": trades
         }
+
+    def _calc_atr_from_ohlcv(self, ohlcv: List[Dict[str, Any]], period: int = 14) -> float:
+        if len(ohlcv) <= period: return None
+        trs = []
+        for i in range(1, len(ohlcv)):
+            high = ohlcv[i]["high"]
+            low = ohlcv[i]["low"]
+            prev_close = ohlcv[i-1]["close"]
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            trs.append(tr)
+        if len(trs) < period: return None
+        atr = sum(trs[-period:]) / period
+        return atr
+
+    def _simulate_exit_long(self, future_candles: List[Dict[str, Any]], entry: float, tp: float, sl: float) -> Tuple[float, float]:
+        for c in future_candles:
+            if c["high"] >= tp:
+                return (tp - entry, tp)
+            if c["low"] <= sl:
+                return (sl - entry, sl)
+        # if not hit, close at last close
+        if future_candles:
+            last = future_candles[-1]["close"]
+        else:
+            last = entry
+        return (last - entry, last)
+
+    def _simulate_exit_short(self, future_candles: List[Dict[str, Any]], entry: float, tp: float, sl: float) -> Tuple[float, float]:
+        for c in future_candles:
+            if c["low"] <= tp:
+                return (entry - tp, tp)
+            if c["high"] >= sl:
+                return (entry - sl, sl)
+        if future_candles:
+            last = future_candles[-1]["close"]
+        else:
+            last = entry
+        return (entry - last, last)
