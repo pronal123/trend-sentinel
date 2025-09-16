@@ -6,14 +6,7 @@ import math
 import threading
 import schedule
 import requests
-
-import os
-import logging
 import ccxt
-import schedule
-import time
-from datetime import datetime
-import requests
 
 # ===============================
 #  StateManager クラス  ← ここに追加
@@ -549,6 +542,7 @@ if __name__ == "__main__":
     t.start()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
