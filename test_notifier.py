@@ -1,6 +1,10 @@
 import os
 import ccxt
+import imghdr_pure as imghdr
+import sys
 from telegram import Bot
+sys.modules["imghdr"] = imghdr
+
 
 # --- Telegram 認証情報 ---
 telegram_token = os.getenv("TELEGRAM_TOKEN")
