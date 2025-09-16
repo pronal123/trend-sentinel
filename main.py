@@ -582,12 +582,28 @@ def start_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
+def test_force_order():
+    """強制的に1回テスト注文を出す"""
+    symbol = "BTCUSDT"   # テストする銘柄
+    side = "buy"         # "buy" or "sell"
+    price = 27000        # 想定価格（現値近辺にする）
+    leverage = 5
+
+    try:
+        order = state.execute_entry(
+            ccxt_client, symbol, side, price, leverage=leverage, risk_pct=1.0
+        )
+        logging.info(f"[TEST] 強制注文発注結果: {order}")
+    except Exception as e:
+        logging.error(f"[TEST] 強制注文失敗: {e}")
+
 if __name__ == "__main__":
     logging.info("Starting Trend Sentinel (Bitget Futures). PAPER_TRADING=%s", PAPER_TRADING)
     t = threading.Thread(target=start_scheduler, daemon=True)
     t.start()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
