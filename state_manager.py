@@ -54,9 +54,19 @@ class StateManager:
         return (wins / total_trades) * 100
 
     # === ここを追加 ===
-    def update_last_snapshot(self, snapshot):
-        """マーケット状態のスナップショットを保存"""
-        self.last_snapshot = snapshot
+    def update_last_snapshot(self, market_data, balance, positions):
+        """
+        最新の状態をスナップショットとして保存
+        market_data: dict (テクニカル指標や価格情報)
+        balance: dict (Bitgetの口座残高 fetch_balance の結果)
+        positions: list (Bitgetのポジション情報 fetch_positions の結果)
+        """
+        self.last_snapshot = {
+            "market_data": market_data,
+            "balance": balance,
+            "positions": positions,
+            "timestamp": time.time()
+        }
 
     def get_last_snapshot(self):
         """保存されたスナップショットを取得"""
