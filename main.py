@@ -597,13 +597,20 @@ def test_force_order():
     except Exception as e:
         logging.error(f"[TEST] 強制注文失敗: {e}")
 
+
 if __name__ == "__main__":
     logging.info("Starting Trend Sentinel (Bitget Futures). PAPER_TRADING=%s", PAPER_TRADING)
+
+    # ここで強制テスト注文を一度だけ実行
+    test_force_order()
+
+    # スケジューラーを起動
     t = threading.Thread(target=start_scheduler, daemon=True)
     t.start()
+
+    # Flask API サーバー起動
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
-
 
 
 
