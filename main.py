@@ -202,6 +202,38 @@ def fetch_orderbook(symbol: str, depth: int = 50) -> Dict[str, Any]:
         logging.debug("fetch_orderbook failed %s", e)
         return {"bids": [], "asks": [], "bid_vol": 0.0, "ask_vol": 0.0}
 
+def dynamic_leverage(balance: float, atr: float, price: float) -> int:
+    """
+    残高とボラティリティに応じてレバレッジを決定する
+    balance: USDT 残高
+    atr:     ATR 値
+    price:   現在価格
+    """
+    # --- 残高ベース調整 ---
+    if balance < 500:
+        lev_by_balance = 10
+    elif balance < 2000:
+        lev_by_balance = 7
+    elif balance < 10000:
+        lev_by_balance = 5
+    else:
+        lev_by_balance = 3
+
+    # --- ボラティリティ調整 ---
+    vol_ratio = atr / max(price, 1e-9)
+    if vol_ratio > 0.05:   # ATRが価格の5%以上 → 超高ボラ
+        lev_by_vol = 2
+    elif vol_ratio > 0.03: # 高ボラ
+        lev_by_vol = 3
+    elif vol_ratio > 0.015: # 中ボラ
+        lev_by_vol = 5
+    else:                  # 低ボラ
+        lev_by_vol = 7
+
+    # --- 最終レバレッジは balance側とvol側の最小値を採用 ---
+    leverage = min(lev_by_balance, lev_by_vol)
+    return max(1, leverage)  # 1倍未満にならないよう制限
+
 # AI-style comment generation (rule-based multi-layer)
 def generate_ai_comment(symbol: str, price: float, atr: float, ob: Dict[str,Any], fg: Dict[str,Any], ohlcv_recent) -> str:
     parts = []
@@ -556,6 +588,7 @@ if __name__ == "__main__":
     t.start()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
