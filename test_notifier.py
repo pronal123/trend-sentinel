@@ -3,56 +3,78 @@ import ccxt
 import requests
 from datetime import datetime, timezone, timedelta
 
-# ==== 環境変数 ====
-BITGET_API_KEY = os.getenv("BITGET_API_KEY")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
-BITGET_API_PASSWORD = os.getenv("BITGET_API_PASSWORD")
+# --------------------
+# 環境変数の取得
+# --------------------
+BITGET_API_KEY = os.getenv("BITGET_API_KEY_FUTURES", "")
+BITGET_API_SECRET = os.getenv("BITGET_API_SECRET_FUTURES", "")
+BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE_FUTURES", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# ==== Bitget 初期化 ====
-exchange = ccxt.bitget({
-    "apiKey": BITGET_API_KEY,
-    "secret": BITGET_API_SECRET,
-    "password": BITGET_API_PASSWORD,
-    "enableRateLimit": True,
-    "options": {"defaultType": "swap"},
-})
-
-# ==== データ取得 ====
-balance = exchange.fetch_balance()
-positions = exchange.fetch_positions()
-
-# ==== Telegram 送信関数 ====
+# --------------------
+# Telegram送信関数
+# --------------------
 def send_telegram_message(text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("環境変数 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID が未設定です")
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     }
-    r = requests.post(url, json=payload)
+    r = requests.post(url, json=payload, timeout=10)
+    r.raise_for_status()
     return r.json()
 
-# ==== メッセージ作成 ====
-jst = timezone(timedelta(hours=9))
-now = datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S JST")
+# --------------------
+# JSTの現在時刻
+# --------------------
+def now_jst():
+    return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9)))
 
-msg = f"✅ テスト通知 ({now})\n\n"
-msg += f"残高(USDT): {balance['total'].get('USDT', 'N/A')}\n\n"
+# --------------------
+# メイン処理
+# --------------------
+if __name__ == "__main__":
+    print("=== 環境変数チェック ===")
+    print("BITGET_API_KEY:", "OK" if BITGET_API_KEY else "MISSING")
+    print("BITGET_API_SECRET:", "OK" if BITGET_API_SECRET else "MISSING")
+    print("BITGET_API_PASSPHRASE:", "OK" if BITGET_API_PASSPHRASE else "MISSING")
+    print("TELEGRAM_TOKEN:", "OK" if TELEGRAM_TOKEN else "MISSING")
+    print("TELEGRAM_CHAT_ID:", "OK" if TELEGRAM_CHAT_ID else "MISSING")
 
-if positions:
-    msg += "📊 現在のポジション:\n"
-    for p in positions:
-        symbol = p.get("symbol")
-        side = p.get("side")
-        size = p.get("contracts", 0)
-        upnl = p.get("unrealizedPnl", 0)
-        msg += f"- {symbol} {side} {size}枚 / 含み損益: {upnl:.2f} USDT\n"
-else:
-    msg += "📊 現在ポジションなし\n"
+    # Bitget クライアント作成
+    exchange = None
+    try:
+        exchange = ccxt.bitget({
+            "apiKey": BITGET_API_KEY,
+            "secret": BITGET_API_SECRET,
+            "password": BITGET_API_PASSPHRASE,
+            "enableRateLimit": True,
+        })
+        print("\n✅ Bitgetクライアント作成成功")
+    except Exception as e:
+        print("\n❌ Bitgetクライアント作成失敗:", e)
 
-# ==== 送信 ====
-result = send_telegram_message(msg)
-print("送信結果:", result)
+    # 残高・ポジション確認
+    if exchange:
+        try:
+            balance = exchange.fetch_balance()
+            positions = exchange.fetch_positions()
+            print("\n✅ Bitget API呼び出し成功")
+            print("USDT残高:", balance.get("total", {}).get("USDT", "N/A"))
+            print("ポジション数:", len(positions))
+        except Exception as e:
+            print("\n❌ Bitget APIエラー:", e)
+
+    # Telegram送信テスト
+    try:
+        msg = f"🚀 テスト通知\n時刻: {now_jst().strftime('%Y-%m-%d %H:%M:%S JST')}"
+        result = send_telegram_message(msg)
+        print("\n✅ Telegram送信成功:", result)
+    except Exception as e:
+        print("\n❌ Telegram送信エラー:", e)
