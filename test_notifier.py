@@ -1,89 +1,85 @@
 import os
 import ccxt
-import requests
-from datetime import datetime, timezone, timedelta
+import logging
+from telegram import Bot
+import asyncio
 
-# --------------------
-# 環境変数の取得
-# --------------------
-BITGET_API_KEY = os.getenv("BITGET_API_KEY_FUTURES", "")
-BITGET_API_SECRET = os.getenv("BITGET_API_SECRET_FUTURES", "")
-BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE_FUTURES", "")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# --------------------
-# Telegram送信関数
-# --------------------
-def send_telegram_message(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("環境変数 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID が未設定です")
+# --- Telegram BOT ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+bot = Bot(token=TELEGRAM_TOKEN)
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    r = requests.post(url, json=payload, timeout=10)
-    r.raise_for_status()
-    return r.json()
+# --- Bitget 現物 API ---
+bitget_spot = ccxt.bitget({
+    "apiKey": os.getenv("BITGET_API_KEY_SPOT"),
+    "secret": os.getenv("BITGET_API_SECRET_SPOT"),
+    "password": os.getenv("BITGET_API_PASSPHRASE_SPOT"),
+    "enableRateLimit": True,
+    "options": {"defaultType": "spot"}
+})
 
-# --------------------
-# JSTの現在時刻
-# --------------------
-def now_jst():
-    return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9)))
+# --- Bitget 先物 API ---
+bitget_futures = ccxt.bitget({
+    "apiKey": os.getenv("BITGET_API_KEY_FUTURES"),
+    "secret": os.getenv("BITGET_API_SECRET_FUTURES"),
+    "password": os.getenv("BITGET_API_PASSPHRASE_FUTURES"),
+    "enableRateLimit": True,
+    "options": {"defaultType": "swap"}  # 永続先物
+})
 
-# --------------------
-# メイン処理
-# --------------------
+
+async def main():
+    logging.info("=== Bitget Spot / Futures API & Telegram Notification Test ===")
+
+    try:
+        # --- 現物残高 ---
+        spot_balance = bitget_spot.fetch_balance({'type': 'spot'})
+        spot_summary = {k: v for k, v in spot_balance['total'].items() if v > 0}
+
+        # --- 先物残高 ---
+        futures_balance = bitget_futures.fetch_balance({'type': 'future'})
+        futures_summary = {k: v for k, v in futures_balance['total'].items() if v > 0}
+
+        # --- 先物ポジション ---
+        futures_positions = bitget_futures.fetch_positions()
+        open_positions = [p for p in futures_positions if float(p.get("contracts", 0)) > 0]
+
+        # --- 通知メッセージ作成 ---
+        msg = "✅ *Bitget API / Telegram Test 成功*\n\n"
+
+        msg += "📊 *Spot 残高:*\n"
+        if spot_summary:
+            for coin, amount in spot_summary.items():
+                msg += f"- {coin}: {amount}\n"
+        else:
+            msg += "- 保有なし\n"
+
+        msg += "\n📊 *Futures 残高:*\n"
+        if futures_summary:
+            for coin, amount in futures_summary.items():
+                msg += f"- {coin}: {amount}\n"
+        else:
+            msg += "- 保有なし\n"
+
+        msg += "\n📈 *Futures ポジション:*\n"
+        if open_positions:
+            for pos in open_positions:
+                msg += (
+                    f"- {pos['symbol']} | {pos['side']} | "
+                    f"契約数: {pos['contracts']} | 未実現PnL: {pos['unrealizedPnl']}\n"
+                )
+        else:
+            msg += "- ポジションなし\n"
+
+        # --- Telegram 通知 ---
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
+        logging.info("✅ Telegram通知を送信しました")
+
+    except Exception as e:
+        logging.error(f"❌ エラー: {e}")
+
+
 if __name__ == "__main__":
-    print("=== 環境変数チェック ===")
-    print("BITGET_API_KEY:", "OK" if BITGET_API_KEY else "MISSING")
-    print("BITGET_API_SECRET:", "OK" if BITGET_API_SECRET else "MISSING")
-    print("BITGET_API_PASSPHRASE:", "OK" if BITGET_API_PASSPHRASE else "MISSING")
-    print("TELEGRAM_TOKEN:", "OK" if TELEGRAM_TOKEN else "MISSING")
-    print("TELEGRAM_CHAT_ID:", "OK" if TELEGRAM_CHAT_ID else "MISSING")
-
-    # Bitget クライアント作成
-    exchange = None
-    try:
-        exchange = ccxt.bitget({
-            "apiKey": BITGET_API_KEY,
-            "secret": BITGET_API_SECRET,
-            "password": BITGET_API_PASSPHRASE,
-            "enableRateLimit": True,
-        })
-        print("\n✅ Bitgetクライアント作成成功")
-    except Exception as e:
-        print("\n❌ Bitgetクライアント作成失敗:", e)
-
-    # 残高・ポジション確認
-    if exchange:
-        try:
-            spot_balance = exchange.fetch_balance({"type": "spot"})
-            futures_balance = exchange.fetch_balance({"type": "swap"})
-            positions = exchange.fetch_positions()
-
-            print("\n✅ Bitget API呼び出し成功")
-            print("【現物残高】USDT:", spot_balance.get("total", {}).get("USDT", "N/A"))
-            print("【先物残高】USDT:", futures_balance.get("total", {}).get("USDT", "N/A"))
-            print("ポジション数:", len(positions))
-        except Exception as e:
-            print("\n❌ Bitget APIエラー:", e)
-
-    # Telegram送信テスト
-    try:
-        msg = (
-            f"🚀 テスト通知\n"
-            f"時刻: {now_jst().strftime('%Y-%m-%d %H:%M:%S JST')}\n"
-            f"現物USDT残高: {spot_balance.get('total', {}).get('USDT', 'N/A')}\n"
-            f"先物USDT残高: {futures_balance.get('total', {}).get('USDT', 'N/A')}\n"
-            f"ポジション数: {len(positions)}"
-        )
-        result = send_telegram_message(msg)
-        print("\n✅ Telegram送信成功:", result)
-    except Exception as e:
-        print("\n❌ Telegram送信エラー:", e)
+    asyncio.run(main())
