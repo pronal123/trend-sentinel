@@ -1,7 +1,7 @@
 import time
 import ccxt
 import os
-from telegram_notifier import notify_new_entry, notify_exit, notify_summary, bot, TELEGRAM_CHAT_ID
+from telegram_notifier import notify_new_entry, notify_exit, notify_summary
 
 # ==============================
 # Bitget SPOT 設定
@@ -48,8 +48,8 @@ def fetch_bitget_status():
     return results
 
 
-def send_balance_report():
-    """Telegramに現物/先物残高・ポジションを送信"""
+def format_balance_report():
+    """現物/先物残高・ポジションをフォーマット"""
     status = fetch_bitget_status()
 
     msg = "📊 *Bitget 現物・先物残高/ポジション レポート*\n\n"
@@ -83,14 +83,14 @@ def send_balance_report():
     else:
         msg += "なし\n"
 
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
+    return msg
 
 
 if __name__ == "__main__":
     print("🚀 Telegram通知 + Bitget SPOT/FUTURES テスト開始")
 
     # 1. 残高・ポジション通知
-    send_balance_report()
+    notify_summary(format_balance_report())
     time.sleep(2)
 
     # 2. 新規エントリー通知
@@ -100,12 +100,5 @@ if __name__ == "__main__":
     # 3. 決済通知
     notify_exit(symbol="BTC/USDT", size=0.01, price=60500, pnl=+50.0, reason="テスト利確")
     time.sleep(2)
-
-    # 4. サマリー通知
-    notify_summary()
-    time.sleep(2)
-
-    # 5. 日次損益リセット通知
-    reset_daily_pnl()
 
     print("\n✅ テスト通知を送信しました")
