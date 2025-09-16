@@ -584,18 +584,23 @@ def start_scheduler():
 
 def test_force_order():
     """強制的に1回テスト注文を出す"""
-    symbol = "BTCUSDT"   # テストする銘柄
-    side = "buy"         # "buy" or "sell"
-    price = 27000        # 想定価格（現値近辺にする）
+    symbol = "BTC/USDT:USDT"   # Bitget でのペア表記
+    side = "buy"               # "buy" or "sell"
     leverage = 5
 
     try:
+        # execute_entry に渡す（数量計算は StateManager 側で自動処理）
         order = state.execute_entry(
-            ccxt_client, symbol, side, price, leverage=leverage, risk_pct=1.0
+            ccxt_client,
+            market_symbol=symbol,
+            side=side,
+            risk_pct=1.0,   # 残高の1%をリスクにする
+            leverage=leverage
         )
         logging.info(f"[TEST] 強制注文発注結果: {order}")
     except Exception as e:
         logging.error(f"[TEST] 強制注文失敗: {e}")
+
 
 
 if __name__ == "__main__":
@@ -611,6 +616,7 @@ if __name__ == "__main__":
     # Flask API サーバー起動
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
