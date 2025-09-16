@@ -1,7 +1,7 @@
 import time
 import ccxt
 import os
-from telegram_notifier import notify_new_entry, notify_exit, notify_summary, reset_daily_pnl, bot, TELEGRAM_CHAT_ID
+from telegram_notifier import notify_new_entry, notify_exit, notify_summary, bot, TELEGRAM_CHAT_ID
 
 # ==============================
 # Bitget SPOT 設定
