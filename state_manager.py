@@ -214,28 +214,82 @@ class StateManager:
     # ---------------------------
     # simple order execution helpers
     # ---------------------------
-    def execute_entry(self, exchange, market_symbol: str, side: str, amount: float, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        """
-        市場成行でエントリー（例: side='buy' or 'sell'）
-        - exchange: ccxt exchange instance
-        - market_symbol: 取引ペア 表記は exchange に合わせる (例: "BTC/USDT" or "BTC/USDT:USDT")
-        - amount: 取引数量（asset単位または契約数量、exchangeによる）
-        - params: 追加パラメータ
-        戻り値: order dict または None
-        """
-        params = params or {}
-        try:
-            # create market order (ccxt は exchange.create_order か create_market_buy_order など)
-            # まず create_order を試みる（ほとんどの exchange で動く）
-            order = exchange.create_order(symbol=market_symbol, type="market", side=side, amount=amount, params=params)
-            # マッチしたら内部ポジションを更新（簡易）
-            self.set_position(market_symbol, True, {"entry_order": order})
-            self.increment_entry()
-            logging.info("Executed entry %s %s %s", market_symbol, side, amount)
-            return order
-        except Exception as e:
-            logging.error("execute_entry error for %s: %s", market_symbol, e)
+def execute_entry(
+    self,
+    exchange,
+    market_symbol: str,
+    side: str,
+    risk_pct: float = 1.0,
+    leverage: int = 1,
+    params: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    残高とリスク割合に基づいて数量を自動計算し、市場成行でエントリー
+    - exchange: ccxt exchange instance
+    - market_symbol: "BTC/USDT:USDT" (Bitgetの場合)
+    - side: "buy" または "sell"
+    - risk_pct: 残高の何%を1トレードに使うか
+    - leverage: レバレッジ倍率
+    - params: 追加パラメータ
+    """
+
+    try:
+        # 残高取得（USDT基準）
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['total'].get('USDT', 0)
+        if usdt_balance <= 0:
+            logging.error("残高が不足しているため発注できません")
             return None
+
+        # 現在価格取得
+        ticker = exchange.fetch_ticker(market_symbol)
+        price = ticker['last']
+
+        # 注文金額 = 残高 × (リスク割合 / 100) × レバレッジ
+        notional = usdt_balance * (risk_pct / 100.0) * leverage
+
+        # 数量計算（例: BTC数量）
+        amount = notional / price
+
+        logging.info(
+            f"[ENTRY] symbol={market_symbol}, side={side}, "
+            f"price≈{price}, amount={amount:.6f}, "
+            f"notional={notional:.2f}USDT, leverage={leverage}"
+        )
+
+        # レバレッジ設定（Bitget専用）
+        try:
+            exchange.set_leverage(leverage, symbol=market_symbol)
+        except Exception as e:
+            logging.warning(f"レバレッジ設定失敗: {e}")
+
+        # 成行注文
+        order = exchange.create_order(
+            symbol=market_symbol,
+            type="market",
+            side=side,
+            amount=amount,
+            params=params or {}
+        )
+
+        # StateManagerにポジション登録
+        self.set_position(
+            market_symbol,
+            status=True,
+            details={
+                "side": side,
+                "amount": amount,
+                "entry_price": price,
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "leverage": leverage
+            }
+        )
+
+        return order
+
+    except Exception as e:
+        logging.error(f"エントリー失敗: {e}")
+        return None
 
     def execute_exit(self, exchange, market_symbol: str, amount: float, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """
