@@ -128,6 +128,10 @@ class StateManager:
     def get_open_tokens(self) -> List[str]:
         return [t for t, v in self.positions.items() if v.get("in_position")]
 
+    # alias for compatibility
+    def get_positions(self) -> Dict[str, Dict[str, Any]]:
+        return self.get_all_positions()
+
     # ---------------------------
     # trade statistics
     # ---------------------------
@@ -234,6 +238,7 @@ class StateManager:
         """
         成行エントリーを行う
         - amount を直接指定するか、risk_pct + leverage + usdt_balance から自動計算する
+        - usdt_balance が None の場合は自動で fetch_balance() から取得
         """
         params = params or {}
 
@@ -244,8 +249,17 @@ class StateManager:
 
         try:
             if amount is None:
-                if usdt_balance is None or risk_pct is None or leverage is None:
-                    raise ValueError("amount を指定するか、usdt_balance + risk_pct + leverage を渡してください")
+                if risk_pct is None or leverage is None:
+                    raise ValueError("amount を指定するか、risk_pct + leverage を渡してください")
+
+                # balance 自動取得
+                if usdt_balance is None:
+                    balance = self.sync_balance(exchange)
+                    usdt_balance = balance.get("total", {}).get("USDT", 0) if balance else 0
+
+                if usdt_balance <= 0:
+                    raise ValueError("USDT残高が不足しています")
+
                 amount = self.calculate_position_size(exchange, market_symbol, usdt_balance, risk_pct, leverage)
 
             order = exchange.create_order(
