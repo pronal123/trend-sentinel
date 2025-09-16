@@ -1,10 +1,13 @@
 import os
 import ccxt
-import imghdr_pure as imghdr
 import sys
+import types
 from telegram import Bot
-sys.modules["imghdr"] = imghdr
 
+# --- imghdr ダミーを挿入 (Python 3.13 対応用) ---
+imghdr = types.ModuleType("imghdr")
+imghdr.what = lambda *args, **kwargs: None
+sys.modules["imghdr"] = imghdr
 
 # --- Telegram 認証情報 ---
 telegram_token = os.getenv("TELEGRAM_TOKEN")
