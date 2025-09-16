@@ -219,25 +219,33 @@ def load_state(self) -> None:
     # ---------------------------
     # simple order execution helpers
     # ---------------------------
-    def execute_entry(
-        self,
-        exchange,
-        market_symbol: str,
-        side: str,
-        risk_pct: float = 1.0,
-        leverage: int = 1,
-        params: Optional[Dict[str, Any]] = None
-    ) -> Optional[Dict[str, Any]]:
-        """
-        残高とリスク割合に基づいて数量を自動計算し、市場成行でエントリー
-        """
-        try:
-            # 残高取得（USDT基準）
-            balance = exchange.fetch_balance()
-            usdt_balance = balance['total'].get('USDT', 0)
-            if usdt_balance <= 0:
-                logging.error("残高が不足しているため発注できません")
-                return None
+def execute_entry(self, exchange, market_symbol: str, side: str, amount: float, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    params = params or {}
+
+    if self.hedge_mode:
+        # 両方向モードでは positionSide が必須
+        if side.lower() == "buy":
+            params["positionSide"] = "long"
+        elif side.lower() == "sell":
+            params["positionSide"] = "short"
+    else:
+        # 片方向モード用 fallback
+        params["reduceOnly"] = params.get("reduceOnly", False)
+
+    try:
+        order = exchange.create_order(
+            market_symbol,
+            type="market",
+            side=side,
+            amount=amount,
+            params=params,
+        )
+        logging.info(f"[ENTRY] 注文成功: {order}")
+        return order
+    except Exception as e:
+        logging.error(f"エントリー失敗: {e}")
+        return None
+
 
             # 現在価格取得
             ticker = exchange.fetch_ticker(market_symbol)
