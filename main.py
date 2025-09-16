@@ -109,8 +109,16 @@ state = StateManager()
 executor = TradingExecutor(state)
 
 # ccxt client for market data (no API keys needed for public data)
+import ccxt
+import os
+
 ccxt_client = ccxt.bitget({
-    "enableRateLimit": True,
+    "apiKey": os.getenv("BITGET_API_KEY"),
+    "secret": os.getenv("BITGET_API_SECRET"),
+    "password": os.getenv("BITGET_API_PASSWORD"),  # Bitget はこれ必須
+    "options": {
+        "defaultType": "swap"   # USDT-M 先物
+    }
 })
 
 app = Flask(__name__)
@@ -616,6 +624,7 @@ if __name__ == "__main__":
     # Flask API サーバー起動
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
