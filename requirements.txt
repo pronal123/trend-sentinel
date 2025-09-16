@@ -1,4 +1,5 @@
 # requirements.txt
+python-3.12.6
 Flask
 gunicorn
 python-dotenv
@@ -15,5 +16,6 @@ googletrans==4.0.0-rc1
 feedparser
 numpy
 imghdr-pure
+
 
 
