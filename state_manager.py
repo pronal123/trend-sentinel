@@ -10,6 +10,7 @@ class StateManager:
     def __init__(self, state_file="state.json", notification_interval=21600):
         self.state_file = state_file
         self.notification_interval = notification_interval
+        self.last_snapshot = None  # ← 追加
         self.notified_tokens = {}
         self.positions = {}  # {'token_id': {'in_position': True, 'details': {...}}}
         self.trade_history = []  # [{'token_id': str, 'result': 'win'/'loss'}]
@@ -18,6 +19,15 @@ class StateManager:
         self.exit_count = 0
         self.realized_pnl = []  # [{'timestamp': 'YYYY-MM-DD HH:MM:SS', 'pnl': float}]
         self.load_state()
+
+    # === ここを追加 ===
+    def update_last_snapshot(self, snapshot):
+        """マーケット状態のスナップショットを保存"""
+        self.last_snapshot = snapshot
+
+    def get_last_snapshot(self):
+        """保存されたスナップショットを取得"""
+        return self.last_snapshot
 
     # ---------- state persistence ----------
     def save_state(self):
