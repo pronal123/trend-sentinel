@@ -1,4 +1,3 @@
-# state_manager.py
 import json
 import os
 import time
@@ -23,17 +22,17 @@ class StateManager:
         # tokens already notified (for notifications throttling, optional)
         self.notified_tokens: Dict[str, Any] = {}
 
-        # positions: dict keyed by symbol (e.g. "BTC/USDT")
+        # positions: dict keyed by symbol
         self.positions: Dict[str, Dict[str, Any]] = {}
 
-        # pending signals
+        # pending signals (before execution)
         self.pending_signals: Dict[str, Dict[str, Any]] = {}
 
         # trade / performance tracking
         self.trade_history: List[Dict[str, Any]] = []
         self.entry_count: int = 0
         self.exit_count: int = 0
-        self.realized_pnl: List[Dict[str, Any]] = []
+        self.realized_pnl: List[Dict[str, Any]] = []  # [{timestamp: str, pnl: float}]
 
         # load persisted state if exists
         self.load_state()
@@ -206,18 +205,49 @@ class StateManager:
     # ---------------------------
     # simple order execution helpers
     # ---------------------------
-    def execute_entry(self, exchange, market_symbol: str, side: str, amount: float,
-                      params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    def calculate_position_size(self, exchange, market_symbol: str, usdt_balance: float, risk_pct: float, leverage: int):
+        try:
+            ticker = exchange.fetch_ticker(market_symbol)
+            price = ticker['last']
+            notional = usdt_balance * (risk_pct / 100.0) * leverage
+            amount = notional / price
+            logging.info(
+                f"[SIZE] symbol={market_symbol}, price≈{price}, amount={amount:.6f}, "
+                f"notional={notional:.2f}USDT, leverage={leverage}"
+            )
+            return amount
+        except Exception as e:
+            logging.error(f"calculate_position_size error: {e}")
+            return 0.0
+
+    def execute_entry(
+        self,
+        exchange,
+        market_symbol: str,
+        side: str,
+        amount: Optional[float] = None,
+        risk_pct: Optional[float] = None,
+        leverage: Optional[int] = None,
+        usdt_balance: Optional[float] = None,
+        params: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        成行エントリーを行う
+        - amount を直接指定するか、risk_pct + leverage + usdt_balance から自動計算する
+        """
         params = params or {}
+
         if self.hedge_mode:
-            if side.lower() == "buy":
-                params["positionSide"] = "long"
-            elif side.lower() == "sell":
-                params["positionSide"] = "short"
+            params["positionSide"] = "long" if side.lower() == "buy" else "short"
         else:
             params["reduceOnly"] = params.get("reduceOnly", False)
 
         try:
+            if amount is None:
+                if usdt_balance is None or risk_pct is None or leverage is None:
+                    raise ValueError("amount を指定するか、usdt_balance + risk_pct + leverage を渡してください")
+                amount = self.calculate_position_size(exchange, market_symbol, usdt_balance, risk_pct, leverage)
+
             order = exchange.create_order(
                 market_symbol,
                 type="market",
@@ -229,45 +259,25 @@ class StateManager:
             logging.info(f"[ENTRY] 注文成功: {order}")
             return order
         except Exception as e:
-            logging.error(f"エントリー失敗: {e}")
+            logging.error(f"[ENTRY] エントリー失敗: {e}")
             return None
 
-    def calculate_position_size(self, exchange, market_symbol: str,
-                                usdt_balance: float, risk_pct: float, leverage: int) -> float:
-        try:
-            ticker = exchange.fetch_ticker(market_symbol)
-            price = ticker['last']
-            notional = usdt_balance * (risk_pct / 100.0) * leverage
-            amount = notional / price
-            logging.info(
-                f"[ENTRY] symbol={market_symbol}, "
-                f"price≈{price}, amount={amount:.6f}, "
-                f"notional={notional:.2f}USDT, leverage={leverage}"
-            )
-            return amount
-        except Exception as e:
-            logging.error(f"ポジションサイズ計算失敗: {e}")
-            return 0.0
-
-    def execute_exit(self, exchange, market_symbol: str, amount: float,
-                     params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    def execute_exit(self, exchange, market_symbol: str, amount: float, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         params = params or {}
         try:
             details = self.get_position_details(market_symbol)
             if not details:
                 logging.warning("No position details for %s, attempting simple market sell", market_symbol)
-                order = exchange.create_order(
-                    symbol=market_symbol, type="market", side="sell", amount=amount, params=params
-                )
+                order = exchange.create_order(symbol=market_symbol, type="market", side="sell", amount=amount, params=params)
             else:
                 pos_side = details.get("side") or details.get("positionSide") or details.get("direction")
                 side_to_send = "sell"
                 if isinstance(pos_side, str):
                     if pos_side.lower() in ("short", "sell"):
                         side_to_send = "buy"
-                order = exchange.create_order(
-                    symbol=market_symbol, type="market", side=side_to_send, amount=amount, params=params
-                )
+                    else:
+                        side_to_send = "sell"
+                order = exchange.create_order(symbol=market_symbol, type="market", side=side_to_send, amount=amount, params=params)
 
             self.remove_position(market_symbol)
             self.increment_exit()
