@@ -58,21 +58,22 @@ def save_state(self) -> None:
     except Exception as e:
         logging.error("StateManager.save_state error: %s", e)
 
-    def load_state(self) -> None:
-        if not os.path.exists(self.state_file):
-            return
-        try:
-            with open(self.state_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.notified_tokens = data.get("notified_tokens", {})
-            self.positions = data.get("positions", {})
-            self.pending_signals = data.get("pending_signals", {})
-            self.trade_history = data.get("trade_history", [])
-            self.entry_count = data.get("entry_count", 0)
-            self.exit_count = data.get("exit_count", 0)
-            self.realized_pnl = data.get("realized_pnl", [])
-        except Exception as e:
-            logging.error("StateManager.load_state error: %s", e)
+def load_state(self) -> None:
+    if not os.path.exists(self.state_file):
+        return
+    try:
+        with open(self.state_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.notified_tokens = data.get("notified_tokens", {})
+        self.positions = data.get("positions", {})
+        self.pending_signals = data.get("pending_signals", {})
+        self.trade_history = data.get("trade_history", [])
+        self.entry_count = data.get("entry_count", 0)
+        self.exit_count = data.get("exit_count", 0)
+        self.realized_pnl = data.get("realized_pnl", [])
+        self.hedge_mode = data.get("hedge_mode", True)  # ★ デフォルトTrue
+    except Exception as e:
+        logging.error("StateManager.load_state error: %s", e)
 
     # ---------------------------
     # snapshot
