@@ -10,7 +10,7 @@ def main():
     try:
         # --- 環境変数チェック ---
         required_envs = [
-            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_TOKEN",
             "TELEGRAM_CHAT_ID",
             "BITGET_API_KEY_SPOT",
             "BITGET_API_SECRET_SPOT",
