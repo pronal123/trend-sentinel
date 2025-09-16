@@ -56,8 +56,9 @@ exchange = ccxt.bitget({
     "secret": os.getenv("BITGET_API_SECRET"),
     "password": os.getenv("BITGET_API_PASSPHRASE"),
     "enableRateLimit": True,
-    "options": {"defaultType": "swap"}
+    "options": {"defaultType": "swap"}  # ← Futures (USDT-M)
 })
+
 
 # StateManager インスタンスを作成
 state = StateManager()
@@ -548,5 +549,6 @@ if __name__ == "__main__":
     t.start()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
