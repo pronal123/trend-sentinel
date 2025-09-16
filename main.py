@@ -44,13 +44,25 @@ class StateManager:
 # ===============================
 #  Bitget 初期化
 # ===============================
-exchange = ccxt.bitget({
-    "apiKey": os.getenv("BITGET_API_KEY"),
-    "secret": os.getenv("BITGET_API_SECRET"),
-    "password": os.getenv("BITGET_API_PASSPHRASE"),  # ← ここ大事
+# --- Bitget SPOT ---
+bitget_spot = ccxt.bitget({
+    "apiKey": os.getenv("BITGET_API_KEY_SPOT"),
+    "secret": os.getenv("BITGET_API_SECRET_SPOT"),
+    "password": os.getenv("BITGET_API_PASSPHRASE_SPOT"),
     "enableRateLimit": True,
-    "options": {"defaultType": "swap"}
+    "options": {"defaultType": "spot"}
 })
+logging.info("Initialized ccxt.bitget for spot.")
+
+# --- Bitget FUTURES ---
+bitget_futures = ccxt.bitget({
+    "apiKey": os.getenv("BITGET_API_KEY_FUTURES"),
+    "secret": os.getenv("BITGET_API_SECRET_FUTURES"),
+    "password": os.getenv("BITGET_API_PASSPHRASE_FUTURES"),
+    "enableRateLimit": True,
+    "options": {"defaultType": "swap"}  # ← 永続先物
+})
+logging.info("Initialized ccxt.bitget for futures.")
 
 
 # StateManager インスタンスを作成
@@ -542,6 +554,7 @@ if __name__ == "__main__":
     t.start()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
