@@ -590,40 +590,13 @@ def start_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
-def test_force_order():
-    """強制的に1回テスト注文を出す"""
-    symbol = "BTC/USDT:USDT"   # Bitget でのペア表記
-    side = "buy"               # "buy" or "sell"
-    leverage = 5
-
-    try:
-        # execute_entry に渡す（数量計算は StateManager 側で自動処理）
-        order = state.execute_entry(
-            ccxt_client,
-            market_symbol=symbol,
-            side=side,
-            risk_pct=1.0,   # 残高の1%をリスクにする
-            leverage=leverage
-        )
-        logging.info(f"[TEST] 強制注文発注結果: {order}")
-    except Exception as e:
-        logging.error(f"[TEST] 強制注文失敗: {e}")
-
-
-
 if __name__ == "__main__":
     logging.info("Starting Trend Sentinel (Bitget Futures). PAPER_TRADING=%s", PAPER_TRADING)
-
-    # ここで強制テスト注文を一度だけ実行
-    test_force_order()
-
-    # スケジューラーを起動
     t = threading.Thread(target=start_scheduler, daemon=True)
     t.start()
-
-    # Flask API サーバー起動
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
