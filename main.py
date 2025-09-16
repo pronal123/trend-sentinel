@@ -113,11 +113,11 @@ import ccxt
 import os
 
 ccxt_client = ccxt.bitget({
-    "apiKey": os.getenv("BITGET_API_KEY"),
-    "secret": os.getenv("BITGET_API_SECRET"),
-    "password": os.getenv("BITGET_API_PASSWORD"),  # Bitget はこれ必須
+    "apiKey": os.getenv("BITGET_API_KEY_FUTURES"),
+    "secret": os.getenv("BITGET_API_SECRET_FUTURES"),
+    "password": os.getenv("BITGET_API_PASSPHRASE_FUTURES"),  # Bitgetはpassphrase必須
     "options": {
-        "defaultType": "swap"   # USDT-M 先物
+        "defaultType": "swap"  # ← USDT-M 先物
     }
 })
 
@@ -624,6 +624,7 @@ if __name__ == "__main__":
     # Flask API サーバー起動
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
