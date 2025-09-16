@@ -6,6 +6,63 @@ import math
 import threading
 import schedule
 import requests
+
+import os
+import logging
+import ccxt
+import schedule
+import time
+from datetime import datetime
+import requests
+
+# ===============================
+#  StateManager クラス  ← ここに追加
+# ===============================
+class StateManager:
+    def __init__(self):
+        self.positions = []
+        self.balance = None
+        self.last_snapshot = None
+
+    def set_positions(self, positions):
+        self.positions = positions
+
+    def get_positions(self):
+        return self.positions
+
+    def set_balance(self, balance):
+        self.balance = balance
+
+    def get_balance(self):
+        return self.balance
+
+    def update_last_snapshot(self, snapshot, balance, positions):
+        """最新のスナップショット・残高・ポジションを保存"""
+        self.last_snapshot = {
+            "snapshot": snapshot,
+            "balance": balance,
+            "positions": positions
+        }
+
+    def get_last_snapshot(self):
+        return self.last_snapshot
+
+
+# ===============================
+#  Bitget 初期化
+# ===============================
+exchange = ccxt.bitget({
+    "apiKey": os.getenv("BITGET_API_KEY"),
+    "secret": os.getenv("BITGET_API_SECRET"),
+    "password": os.getenv("BITGET_API_PASSPHRASE"),
+    "enableRateLimit": True,
+    "options": {"defaultType": "swap"}
+})
+
+# StateManager インスタンスを作成
+state = StateManager()
+
+
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Tuple
 
@@ -410,7 +467,9 @@ def run_cycle():
         time.sleep(0.05)
 
     # persist snapshot
-    state.update_last_snapshot(snapshot)
+    balance = exchange.fetch_balance({'type': 'future'})
+    positions = exchange.fetch_positions()
+    state.update_last_snapshot(snapshot, balance, positions)
     logging.info("=== cycle finished === %s", utcnow_jst_iso())
 
 # ---------------- position checker for TP/SL (runs each minute) ----------------
@@ -489,4 +548,5 @@ if __name__ == "__main__":
     t.start()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
