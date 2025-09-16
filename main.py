@@ -508,7 +508,7 @@ def run_cycle():
 
     # persist snapshot
     balance = executor.exchange.fetch_balance({'type': 'future'})
-    positions = exchange.fetch_positions()
+    positions = executor.exchange.fetch_positions()
     state.update_last_snapshot(snapshot, balance, positions)
     logging.info("=== cycle finished === %s", utcnow_jst_iso())
 
@@ -588,6 +588,7 @@ if __name__ == "__main__":
     t.start()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
