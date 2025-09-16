@@ -41,21 +41,22 @@ class StateManager:
     # ---------------------------
     # persistence
     # ---------------------------
-    def save_state(self) -> None:
-        try:
-            payload = {
-                "notified_tokens": self.notified_tokens,
-                "positions": self.positions,
-                "pending_signals": self.pending_signals,
-                "trade_history": self.trade_history,
-                "entry_count": self.entry_count,
-                "exit_count": self.exit_count,
-                "realized_pnl": self.realized_pnl,
-            }
-            with open(self.state_file, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logging.error("StateManager.save_state error: %s", e)
+def save_state(self) -> None:
+    try:
+        payload = {
+            "notified_tokens": self.notified_tokens,
+            "positions": self.positions,
+            "pending_signals": self.pending_signals,
+            "trade_history": self.trade_history,
+            "entry_count": self.entry_count,
+            "exit_count": self.exit_count,
+            "realized_pnl": self.realized_pnl,
+            "hedge_mode": self.hedge_mode,  # ★ 追加
+        }
+        with open(self.state_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logging.error("StateManager.save_state error: %s", e)
 
     def load_state(self) -> None:
         if not os.path.exists(self.state_file):
