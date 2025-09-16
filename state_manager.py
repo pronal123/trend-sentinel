@@ -13,6 +13,9 @@ class StateManager:
         self.state_file = state_file
         self.notification_interval = notification_interval
 
+        # 両方向モードを前提に運用するフラグ
+        self.hedge_mode: bool = True
+
         # last snapshot of market / account / positions
         self.last_snapshot: Optional[Dict[str, Any]] = None
 
