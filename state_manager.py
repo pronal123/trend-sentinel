@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, List
 
 JST = timezone(timedelta(hours=9))
 
+
 class StateManager:
     def __init__(self, state_file: str = "state.json", notification_interval: int = 21600):
         self.state_file = state_file
@@ -22,18 +23,17 @@ class StateManager:
         # tokens already notified (for notifications throttling, optional)
         self.notified_tokens: Dict[str, Any] = {}
 
-        # positions: dict keyed by symbol (e.g. "BTC/USDT" or "BTCUSDT" depending on your normalization)
-        # value: {"in_position": bool, "details": { ... }}
+        # positions: dict keyed by symbol (e.g. "BTC/USDT")
         self.positions: Dict[str, Dict[str, Any]] = {}
 
-        # pending signals (before execution)
+        # pending signals
         self.pending_signals: Dict[str, Dict[str, Any]] = {}
 
         # trade / performance tracking
         self.trade_history: List[Dict[str, Any]] = []
         self.entry_count: int = 0
         self.exit_count: int = 0
-        self.realized_pnl: List[Dict[str, Any]] = []  # [{timestamp: str, pnl: float}]
+        self.realized_pnl: List[Dict[str, Any]] = []
 
         # load persisted state if exists
         self.load_state()
@@ -41,45 +41,44 @@ class StateManager:
     # ---------------------------
     # persistence
     # ---------------------------
-def save_state(self) -> None:
-    try:
-        payload = {
-            "notified_tokens": self.notified_tokens,
-            "positions": self.positions,
-            "pending_signals": self.pending_signals,
-            "trade_history": self.trade_history,
-            "entry_count": self.entry_count,
-            "exit_count": self.exit_count,
-            "realized_pnl": self.realized_pnl,
-            "hedge_mode": self.hedge_mode,  # ★ 追加
-        }
-        with open(self.state_file, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logging.error("StateManager.save_state error: %s", e)
+    def save_state(self) -> None:
+        try:
+            payload = {
+                "notified_tokens": self.notified_tokens,
+                "positions": self.positions,
+                "pending_signals": self.pending_signals,
+                "trade_history": self.trade_history,
+                "entry_count": self.entry_count,
+                "exit_count": self.exit_count,
+                "realized_pnl": self.realized_pnl,
+                "hedge_mode": self.hedge_mode,
+            }
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logging.error("StateManager.save_state error: %s", e)
 
-def load_state(self) -> None:
-    if not os.path.exists(self.state_file):
-        return
-    try:
-        with open(self.state_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.notified_tokens = data.get("notified_tokens", {})
-        self.positions = data.get("positions", {})
-        self.pending_signals = data.get("pending_signals", {})
-        self.trade_history = data.get("trade_history", [])
-        self.entry_count = data.get("entry_count", 0)
-        self.exit_count = data.get("exit_count", 0)
-        self.realized_pnl = data.get("realized_pnl", [])
-        self.hedge_mode = data.get("hedge_mode", True)  # ★ デフォルトTrue
-    except Exception as e:
-        logging.error("StateManager.load_state error: %s", e)
+    def load_state(self) -> None:
+        if not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.notified_tokens = data.get("notified_tokens", {})
+            self.positions = data.get("positions", {})
+            self.pending_signals = data.get("pending_signals", {})
+            self.trade_history = data.get("trade_history", [])
+            self.entry_count = data.get("entry_count", 0)
+            self.exit_count = data.get("exit_count", 0)
+            self.realized_pnl = data.get("realized_pnl", [])
+            self.hedge_mode = data.get("hedge_mode", True)
+        except Exception as e:
+            logging.error("StateManager.load_state error: %s", e)
 
     # ---------------------------
     # snapshot
     # ---------------------------
     def update_last_snapshot(self, market_data: Dict[str, Any], balance: Any, positions: Any) -> None:
-        """保存用の最新スナップショット"""
         self.last_snapshot = {
             "market_data": market_data,
             "balance": balance,
@@ -134,7 +133,6 @@ def load_state(self) -> None:
     # trade statistics
     # ---------------------------
     def record_trade_result(self, token_id: str, result: str) -> None:
-        """result: 'win' or 'loss' (optionally other labels)"""
         if result not in ("win", "loss"):
             logging.warning("record_trade_result: unexpected result %s", result)
         self.trade_history.append({"token_id": token_id, "result": result, "timestamp": int(time.time())})
@@ -168,10 +166,9 @@ def load_state(self) -> None:
         return sum(r["pnl"] for r in self.realized_pnl if r["timestamp"].startswith(today))
 
     # ---------------------------
-    # exchange sync helpers (ccxt exchange expected)
+    # exchange sync helpers
     # ---------------------------
     def sync_balance(self, exchange) -> Optional[Dict[str, Any]]:
-        """exchange.fetch_balance() を呼んで残高を取得して返す（例外はログ）"""
         try:
             bal = exchange.fetch_balance()
             logging.info("Synced balance")
@@ -181,26 +178,16 @@ def load_state(self) -> None:
             return None
 
     def sync_positions(self, exchange) -> Optional[Dict[str, Any]]:
-        """
-        exchange.fetch_positions() を呼び出して internal positions を上書きします。
-        注意: exchange によって返却形式が異なるため、ここは適宜調整してください。
-        """
         try:
             positions_raw = []
-            # try common fetch_positions, otherwise fallback to fetch_balance / parse open positions
             if hasattr(exchange, "fetch_positions"):
                 positions_raw = exchange.fetch_positions() or []
             else:
-                # 一部の取引所は fetch_positions を持たない -> fetch_balance からポジション情報を作る必要あり（省略）
                 positions_raw = []
 
-            # normalize into self.positions
             self.positions = {}
             for pos in positions_raw:
-                # pos may be dict with 'symbol' or 'info'
                 symbol = pos.get("symbol") or pos.get("info", {}).get("symbol") or pos.get("info", {}).get("instId")
-                # try to determine if there's an open position (取引所依存)
-                # prioritize common keys:
                 contracts = pos.get("contracts") or pos.get("size") or pos.get("positionAmt") or pos.get("amount") or 0
                 in_pos = False
                 try:
@@ -219,138 +206,69 @@ def load_state(self) -> None:
     # ---------------------------
     # simple order execution helpers
     # ---------------------------
-def execute_entry(self, exchange, market_symbol: str, side: str, amount: float, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    params = params or {}
+    def execute_entry(self, exchange, market_symbol: str, side: str, amount: float,
+                      params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        params = params or {}
+        if self.hedge_mode:
+            if side.lower() == "buy":
+                params["positionSide"] = "long"
+            elif side.lower() == "sell":
+                params["positionSide"] = "short"
+        else:
+            params["reduceOnly"] = params.get("reduceOnly", False)
 
-    if self.hedge_mode:
-        # 両方向モードでは positionSide が必須
-        if side.lower() == "buy":
-            params["positionSide"] = "long"
-        elif side.lower() == "sell":
-            params["positionSide"] = "short"
-    else:
-        # 片方向モード用 fallback
-        params["reduceOnly"] = params.get("reduceOnly", False)
-
-    try:
-        order = exchange.create_order(
-            market_symbol,
-            type="market",
-            side=side,
-            amount=amount,
-            params=params,
-        )
-        logging.info(f"[ENTRY] 注文成功: {order}")
-        return order
-    except Exception as e:
-        logging.error(f"エントリー失敗: {e}")
-        return None
-
-def calculate_position_size(exchange, market_symbol: str, usdt_balance: float, risk_pct: float, leverage: int):
-    """
-    ポジションサイズを計算する
-    - 残高 × (リスク割合/100) × レバレッジ ÷ 現在価格
-    """
-    try:
-        # 現在価格取得
-        ticker = exchange.fetch_ticker(market_symbol)
-        price = ticker['last']
-
-        # 注文金額 = 残高 × (リスク割合 / 100) × レバレッジ
-        notional = usdt_balance * (risk_pct / 100.0) * leverage
-
-        # 数量計算（例: BTC数量）
-        amount = notional / price
-
-        logging.info(
-            f"[ENTRY] symbol={market_symbol}, "
-            f"price≈{price}, amount={amount:.6f}, "
-            f"notional={notional:.2f}USDT, leverage={leverage}"
-        )
-        return amount
-
-    except Exception as e:
-        logging.error(f"ポジションサイズ計算失敗: {e}")
-        return 0.0
-
-            # 現在価格取得
-            ticker = exchange.fetch_ticker(market_symbol)
-            price = ticker['last']
-
-            # 注文金額 = 残高 × (リスク割合 / 100) × レバレッジ
-            notional = usdt_balance * (risk_pct / 100.0) * leverage
-
-            # 数量計算（例: BTC数量）
-            amount = notional / price
-
-            logging.info(
-                f"[ENTRY] symbol={market_symbol}, side={side}, "
-                f"price≈{price}, amount={amount:.6f}, "
-                f"notional={notional:.2f}USDT, leverage={leverage}"
-            )
-
-            # レバレッジ設定（Bitget専用）
-            try:
-                exchange.set_leverage(leverage, symbol=market_symbol)
-            except Exception as e:
-                logging.warning(f"レバレッジ設定失敗: {e}")
-
-            # 成行注文
+        try:
             order = exchange.create_order(
-                symbol=market_symbol,
+                market_symbol,
                 type="market",
                 side=side,
                 amount=amount,
-                params=params or {}
+                params=params,
             )
-
-            # StateManagerにポジション登録
-            self.set_position(
-                market_symbol,
-                status=True,
-                details={
-                    "side": side,
-                    "amount": amount,
-                    "entry_price": price,
-                    "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                    "leverage": leverage
-                }
-            )
-
+            self.increment_entry()
+            logging.info(f"[ENTRY] 注文成功: {order}")
             return order
-
         except Exception as e:
             logging.error(f"エントリー失敗: {e}")
             return None
 
-    def execute_exit(self, exchange, market_symbol: str, amount: float, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        """
-        市場成行で決済（全量 or 部分）を行うラッパー。
-        - amount: 決済数量（asset単位 or contracts）
-        """
+    def calculate_position_size(self, exchange, market_symbol: str,
+                                usdt_balance: float, risk_pct: float, leverage: int) -> float:
+        try:
+            ticker = exchange.fetch_ticker(market_symbol)
+            price = ticker['last']
+            notional = usdt_balance * (risk_pct / 100.0) * leverage
+            amount = notional / price
+            logging.info(
+                f"[ENTRY] symbol={market_symbol}, "
+                f"price≈{price}, amount={amount:.6f}, "
+                f"notional={notional:.2f}USDT, leverage={leverage}"
+            )
+            return amount
+        except Exception as e:
+            logging.error(f"ポジションサイズ計算失敗: {e}")
+            return 0.0
+
+    def execute_exit(self, exchange, market_symbol: str, amount: float,
+                     params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         params = params or {}
         try:
-            # 決済側のサイドは現在のポジションに依存するが、ここではユーザ側で side を決めさせる代わりに
-            # 'close' を params に渡す方式もある。シンプルに market sell/buy を発注する例:
-            # まずポジション詳細を参照
             details = self.get_position_details(market_symbol)
             if not details:
                 logging.warning("No position details for %s, attempting simple market sell", market_symbol)
-                # 決済サイドはポジションの建玉に応じて変えるはずだが、簡便のため 'sell' を投げます
-                order = exchange.create_order(symbol=market_symbol, type="market", side="sell", amount=amount, params=params)
+                order = exchange.create_order(
+                    symbol=market_symbol, type="market", side="sell", amount=amount, params=params
+                )
             else:
-                # try to detect which side to issue as close: if pos has 'side' or 'positionSide'
                 pos_side = details.get("side") or details.get("positionSide") or details.get("direction")
-                # if pos_side indicates 'long'/'buy' -> close with sell
                 side_to_send = "sell"
                 if isinstance(pos_side, str):
                     if pos_side.lower() in ("short", "sell"):
                         side_to_send = "buy"
-                    else:
-                        side_to_send = "sell"
-                order = exchange.create_order(symbol=market_symbol, type="market", side=side_to_send, amount=amount, params=params)
+                order = exchange.create_order(
+                    symbol=market_symbol, type="market", side=side_to_send, amount=amount, params=params
+                )
 
-            # update internal state
             self.remove_position(market_symbol)
             self.increment_exit()
             logging.info("Executed exit %s amount=%s", market_symbol, amount)
