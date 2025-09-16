@@ -11,16 +11,22 @@ class StateManager:
     def __init__(self, state_file="state.json", notification_interval=21600):
         self.state_file = state_file
         self.notification_interval = notification_interval
-        self.last_snapshot = None  # ← 追加
+        self.last_snapshot = None
         self.notified_tokens = {}
-        self.positions = {}  # {'token_id': {'in_position': True, 'details': {...}}}
-        self.trade_history = []  # [{'token_id': str, 'result': 'win'/'loss'}]
-        self.pending_signals = {}  # {'token_id': {...}}
+
+        # 複数銘柄対応
+        # 例: {"BTCUSDT": {"in_position": True, "details": {...}}}
+        self.positions = {}
+
+        self.trade_history = []   # [{'token_id': str, 'result': 'win'/'loss'}]
+        self.pending_signals = {} # {'token_id': {...}}
         self.entry_count = 0
         self.exit_count = 0
-        self.realized_pnl = []  # [{'timestamp': 'YYYY-MM-DD HH:MM:SS', 'pnl': float}]
+        self.realized_pnl = []    # [{'timestamp': 'YYYY-MM-DD HH:MM:SS', 'pnl': float}]
+
         self.load_state()
 
+    # ====== シグナル関連 ======
     def add_pending_signal(self, token_id, details):
         self.pending_signals[token_id] = details
         logging.info(f"Signal for {token_id} is now PENDING CONFIRMATION.")
@@ -30,27 +36,52 @@ class StateManager:
         self.pending_signals = {}
         return pending
 
+    # ====== ポジション管理 ======
     def has_position(self, token_id):
-        return self.positions.get(token_id, {}).get('in_position', False)
+        """指定銘柄にポジションがあるか確認"""
+        return self.positions.get(token_id, {}).get("in_position", False)
 
     def set_position(self, token_id, status, details=None):
-        self.positions[token_id] = {'in_position': status, 'details': details}
+        """ポジションを追加・更新"""
+        self.positions[token_id] = {"in_position": status, "details": details}
         logging.info(f"Position for {token_id} set to {status}.")
 
+    def remove_position(self, token_id):
+        """ポジションを削除（決済時）"""
+        if token_id in self.positions:
+            del self.positions[token_id]
+            logging.info(f"Position for {token_id} removed.")
+
     def get_position_details(self, token_id):
-        return self.positions.get(token_id, {}).get('details')
+        """指定銘柄のポジション詳細を取得"""
+        return self.positions.get(token_id, {}).get("details")
 
     def get_all_positions(self):
-        return {token_id: pos['details'] for token_id, pos in self.positions.items() if pos['in_position']}
+        """現在建玉を持つ銘柄の詳細を返す"""
+        return {
+            token_id: pos["details"]
+            for token_id, pos in self.positions.items()
+            if pos.get("in_position")
+        }
 
+    def get_open_tokens(self):
+        """現在ポジションを持っている銘柄ID一覧"""
+        return [
+            token_id
+            for token_id, pos in self.positions.items()
+            if pos.get("in_position")
+        ]
+
+    # ====== 成績管理 ======
     def record_trade_result(self, token_id, result):
-        if result in ['win', 'loss']:
-            self.trade_history.append({'token_id': token_id, 'result': result})
+        if result in ["win", "loss"]:
+            self.trade_history.append({"token_id": token_id, "result": result})
             logging.info(f"Trade result recorded for {token_id}: {result}")
 
     def get_win_rate(self):
-        if not self.trade_history: return 0.0
-        wins = sum(1 for trade in self.trade_history if trade['result'] == 'win')
+        if not self.trade_history:
+            return 0.0
+        wins = sum(1 for trade in self.trade_history if trade["result"] == "win")
         total_trades = len(self.trade_history)
         return (wins / total_trades) * 100
 
