@@ -1,19 +1,29 @@
 import sys
 import types
+import os
+import ccxt
+import requests
 
 # --- imghdr ダミーを挿入 (Python 3.13 対応用) ---
 imghdr = types.ModuleType("imghdr")
 imghdr.what = lambda *args, **kwargs: None
 sys.modules["imghdr"] = imghdr
 
-import os
-import ccxt
-from telegram import Bot
 
 # --- Telegram 認証情報 ---
 telegram_token = os.getenv("TELEGRAM_TOKEN")
 telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-bot = Bot(token=telegram_token)
+
+def send_telegram_message(message: str):
+    url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+    payload = {"chat_id": telegram_chat_id, "text": message}
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        res.raise_for_status()
+        print("📨 テレグラム通知を送信しました！")
+    except Exception as e:
+        print(f"⚠ Telegram送信失敗: {e}")
+
 
 # --- Bitget APIキー（SPOTとFUTURES両方） ---
 bitget_spot = ccxt.bitget({
@@ -104,8 +114,7 @@ def notify_summary(extra_message: str = ""):
     if extra_message:
         message = extra_message + "\n\n" + message
 
-    bot.send_message(chat_id=telegram_chat_id, text=message)
-    print("📨 テレグラム通知を送信しました！")
+    send_telegram_message(message)
 
 
 # --- 実行部 ---
