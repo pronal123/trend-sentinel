@@ -460,7 +460,9 @@ def run_cycle():
                         logging.info("Skipping %s due to weak backtest pf=%.2f", sym, bt_pf)
                         continue
                 # open position via executor
-                res = executor.open_position(sym, signal, size_usd, last, tp, sl, leverage=int(os.getenv("DEFAULT_LEVERAGE","3")))
+                leverage = dynamic_leverage(balance, atr, last)
+                res = executor.open_position(sym, signal, size_usd, last, tp, sl, leverage=leverage)
+
                 # send telegram
                 msg = f"<b>📥 新規ポジション {'(SIM)' if res.get('simulated') else ''}</b>\n"
                 msg += f"<b>{sym}</b> {signal.upper()} @ <code>{last:.6f}</code>\n"
@@ -554,6 +556,7 @@ if __name__ == "__main__":
     t.start()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
