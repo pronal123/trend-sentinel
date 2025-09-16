@@ -1,117 +1,115 @@
-# telegram_notifier.py
+# state_manager.py
+import json
 import os
 import logging
-import requests
 from datetime import datetime, timezone, timedelta
-from state_manager import StateManager
-
-# 環境変数から取得
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-state = StateManager()
 
 JST = timezone(timedelta(hours=9))
 
+class StateManager:
+    def __init__(self, state_file="state.json", notification_interval=21600):
+        self.state_file = state_file
+        self.notification_interval = notification_interval
+        self.notified_tokens = {}
+        self.positions = {}  # {'token_id': {'in_position': True, 'details': {...}}}
+        self.trade_history = []  # [{'token_id': str, 'result': 'win'/'loss'}]
+        self.pending_signals = {}  # {'token_id': {...}}
+        self.entry_count = 0
+        self.exit_count = 0
+        self.realized_pnl = []  # [{'timestamp': 'YYYY-MM-DD HH:MM:SS', 'pnl': float}]
+        self.load_state()
 
-def send_telegram_message(message: str):
-    """Telegramへメッセージ送信"""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("Telegram設定が未設定です。通知できません。")
-        return
+    # ---------- state persistence ----------
+    def save_state(self):
+        try:
+            state = {
+                "notified_tokens": self.notified_tokens,
+                "positions": self.positions,
+                "trade_history": self.trade_history,
+                "pending_signals": self.pending_signals,
+                "entry_count": self.entry_count,
+                "exit_count": self.exit_count,
+                "realized_pnl": self.realized_pnl,
+            }
+            with open(self.state_file, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            logging.error(f"Failed to save state: {e}")
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code != 200:
-            logging.error(f"Telegram通知失敗: {response.text}")
-    except Exception as e:
-        logging.error(f"Telegram送信エラー: {e}")
+    def load_state(self):
+        if not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file, "r") as f:
+                state = json.load(f)
+            self.notified_tokens = state.get("notified_tokens", {})
+            self.positions = state.get("positions", {})
+            self.trade_history = state.get("trade_history", [])
+            self.pending_signals = state.get("pending_signals", {})
+            self.entry_count = state.get("entry_count", 0)
+            self.exit_count = state.get("exit_count", 0)
+            self.realized_pnl = state.get("realized_pnl", [])
+        except Exception as e:
+            logging.error(f"Failed to load state: {e}")
 
+    # ---------- position management ----------
+    def add_pending_signal(self, token_id, details):
+        self.pending_signals[token_id] = details
+        self.save_state()
+        logging.info(f"Signal for {token_id} is now PENDING CONFIRMATION.")
 
-def notify_entry(token: str, side: str, size: float, price: float, balance: dict):
-    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-    snapshot = state.get_last_snapshot()
-    market_info = ""
-    if snapshot:
-        market_info = f"\n📊 市況: {snapshot.get('price', '?')} USDT, ATR={snapshot.get('atr', '?')}, Score={snapshot.get('score', '?')}"
+    def get_and_clear_pending_signals(self):
+        pending = self.pending_signals
+        self.pending_signals = {}
+        self.save_state()
+        return pending
 
-    msg = (
-        f"🟢 *新規エントリー*\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"日時: {now}\n"
-        f"銘柄: {token}\n"
-        f"方向: {side}\n"
-        f"数量: {size}\n"
-        f"価格: {price}\n"
-        f"残高: {balance.get('USDT', '?'):.2f} USDT\n"
-        f"{market_info}"
-    )
-    send_telegram_message(msg)
+    def has_position(self, token_id):
+        return self.positions.get(token_id, {}).get("in_position", False)
 
+    def set_position(self, token_id, status, details=None):
+        self.positions[token_id] = {"in_position": status, "details": details}
+        self.save_state()
+        logging.info(f"Position for {token_id} set to {status}.")
 
-def notify_exit(token: str, side: str, size: float, price: float, pnl: float, reason: str, balance: dict):
-    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-    snapshot = state.get_last_snapshot()
-    market_info = ""
-    if snapshot:
-        market_info = f"\n📊 市況: {snapshot.get('price', '?')} USDT, ATR={snapshot.get('atr', '?')}, Score={snapshot.get('score', '?')}"
+    def get_position_details(self, token_id):
+        return self.positions.get(token_id, {}).get("details")
 
-    msg = (
-        f"🔴 *ポジションクローズ*\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"日時: {now}\n"
-        f"銘柄: {token}\n"
-        f"方向: {side}\n"
-        f"数量: {size}\n"
-        f"価格: {price}\n"
-        f"損益: {pnl:.2f} USDT\n"
-        f"理由: {reason}\n"
-        f"残高: {balance.get('USDT', '?'):.2f} USDT\n"
-        f"{market_info}"
-    )
-    send_telegram_message(msg)
+    def get_all_positions(self):
+        return {t: pos["details"] for t, pos in self.positions.items() if pos["in_position"]}
 
+    # ---------- trade stats ----------
+    def record_trade_result(self, token_id, result):
+        if result in ["win", "loss"]:
+            self.trade_history.append({"token_id": token_id, "result": result})
+            self.save_state()
+            logging.info(f"Trade result recorded for {token_id}: {result}")
 
-def notify_hourly(balance: dict):
-    """毎時ちょうどに残高とポジション一覧を通知"""
-    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-    positions = state.get_all_positions()
-    today = datetime.now(JST).strftime("%Y-%m-%d")
-    pnl_today = state.get_daily_pnl(today)
+    def get_win_rate(self):
+        if not self.trade_history:
+            return 0.0
+        wins = sum(1 for trade in self.trade_history if trade["result"] == "win")
+        total_trades = len(self.trade_history)
+        return (wins / total_trades) * 100
 
-    # ポジション整形
-    if positions:
-        pos_text = "\n".join(
-            [f"- {t}: {d.get('side')} {d.get('size')} @ {d.get('entry_price')}" for t, d in positions.items()]
-        )
-    else:
-        pos_text = "なし"
+    # ---------- counters ----------
+    def increment_entry(self):
+        self.entry_count += 1
+        self.save_state()
 
-    snapshot = state.get_last_snapshot()
-    market_info = ""
-    if snapshot:
-        market_info = (
-            f"\n📊 市況スナップショット\n"
-            f"価格: {snapshot.get('price', '?')} USDT\n"
-            f"ATR: {snapshot.get('atr', '?')}\n"
-            f"Score: {snapshot.get('score', '?')}"
-        )
+    def increment_exit(self):
+        self.exit_count += 1
+        self.save_state()
 
-    msg = (
-        f"⏰ *定時レポート*\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"日時: {now}\n"
-        f"残高: {balance.get('USDT', '?'):.2f} USDT\n"
-        f"本日確定損益: {pnl_today['realized_usdt']:.2f} USDT / {pnl_today['realized_jpy']:.0f} 円\n"
-        f"エントリー回数: {pnl_today['entry_count']} 回\n"
-        f"決済回数: {pnl_today['exit_count']} 回\n"
-        f"保有ポジション:\n{pos_text}"
-        f"{market_info}"
-    )
-    send_telegram_message(msg)
+    def get_trade_counts(self):
+        return self.entry_count, self.exit_count
+
+    # ---------- PnL ----------
+    def record_realized_pnl(self, pnl_usd: float):
+        now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+        self.realized_pnl.append({"timestamp": now, "pnl": pnl_usd})
+        self.save_state()
+
+    def get_daily_pnl(self):
+        today = datetime.now(JST).strftime("%Y-%m-%d")
+        return sum(r["pnl"] for r in self.realized_pnl if r["timestamp"].startswith(today))
