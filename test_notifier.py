@@ -63,17 +63,26 @@ if __name__ == "__main__":
     # 残高・ポジション確認
     if exchange:
         try:
-            balance = exchange.fetch_balance()
+            spot_balance = exchange.fetch_balance({"type": "spot"})
+            futures_balance = exchange.fetch_balance({"type": "swap"})
             positions = exchange.fetch_positions()
+
             print("\n✅ Bitget API呼び出し成功")
-            print("USDT残高:", balance.get("total", {}).get("USDT", "N/A"))
+            print("【現物残高】USDT:", spot_balance.get("total", {}).get("USDT", "N/A"))
+            print("【先物残高】USDT:", futures_balance.get("total", {}).get("USDT", "N/A"))
             print("ポジション数:", len(positions))
         except Exception as e:
             print("\n❌ Bitget APIエラー:", e)
 
     # Telegram送信テスト
     try:
-        msg = f"🚀 テスト通知\n時刻: {now_jst().strftime('%Y-%m-%d %H:%M:%S JST')}"
+        msg = (
+            f"🚀 テスト通知\n"
+            f"時刻: {now_jst().strftime('%Y-%m-%d %H:%M:%S JST')}\n"
+            f"現物USDT残高: {spot_balance.get('total', {}).get('USDT', 'N/A')}\n"
+            f"先物USDT残高: {futures_balance.get('total', {}).get('USDT', 'N/A')}\n"
+            f"ポジション数: {len(positions)}"
+        )
         result = send_telegram_message(msg)
         print("\n✅ Telegram送信成功:", result)
     except Exception as e:
