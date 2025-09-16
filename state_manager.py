@@ -247,6 +247,30 @@ def execute_entry(self, exchange, market_symbol: str, side: str, amount: float, 
         return None
 
 
+def calculate_position_size(exchange, market_symbol: str, usdt_balance: float, risk_pct: float, leverage: int):
+    """ポジションサイズ計算用"""
+    try:
+        # 現在価格取得
+        ticker = exchange.fetch_ticker(market_symbol)
+        price = ticker['last']
+
+        # 注文金額 = 残高 × (リスク割合 / 100) × レバレッジ
+        notional = usdt_balance * (risk_pct / 100.0) * leverage
+
+        # 数量計算（例: BTC数量）
+        amount = notional / price
+
+        logging.info(
+            f"[ENTRY] symbol={market_symbol}, "
+            f"price≈{price}, amount={amount:.6f}, "
+            f"notional={notional:.2f}USDT, leverage={leverage}"
+        )
+        return amount
+    except Exception as e:
+        logging.error(f"ポジションサイズ計算失敗: {e}")
+        return 0.0
+
+
             # 現在価格取得
             ticker = exchange.fetch_ticker(market_symbol)
             price = ticker['last']
